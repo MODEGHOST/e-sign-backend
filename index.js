@@ -3,14 +3,13 @@ const express = require("express");
 const cors = require("cors");
 const mysql = require("mysql2/promise");
 const nodemailer = require("nodemailer");
+const puppeteer = require("puppeteer");
 
 const app = express();
 
-/* ================= middleware ================= */
 app.use(cors());
 app.use(express.json());
 
-/* ================= MySQL ================= */
 const db = mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
@@ -18,7 +17,6 @@ const db = mysql.createPool({
   database: process.env.DB_NAME,
 });
 
-/* ================= Mail (Gmail App Password) ================= */
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
@@ -27,7 +25,43 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-/* ================= Health check ================= */
+const isDataUrl = (s) => typeof s === "string" && s.startsWith("data:image/");
+
+const uniqEmails = (arr) =>
+  [...new Set((arr || []).map((s) => String(s || "").trim()).filter(Boolean))];
+
+const FRONTEND_BASE_URL =
+  process.env.FRONTEND_BASE_URL || "http://localhost:5173";
+
+const SIGN_LINK_BASE =
+  process.env.SIGN_LINK_BASE || `${FRONTEND_BASE_URL}/sign`;
+
+const FINAL_VIEW_PATH =
+  process.env.FINAL_VIEW_PATH || "/view-signed";
+
+async function renderPdfFromUrl(url) {
+  const browser = await puppeteer.launch({
+    headless: "new",
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1240, height: 1754 });
+    await page.goto(url, { waitUntil: "networkidle0", timeout: 60000 });
+
+    const pdfBuffer = await page.pdf({
+      format: "A4",
+      printBackground: true,
+      margin: { top: "10mm", right: "10mm", bottom: "10mm", left: "10mm" },
+    });
+
+    return pdfBuffer;
+  } finally {
+    await browser.close();
+  }
+}
+
 app.get("/health", async (req, res) => {
   try {
     await db.query("SELECT 1");
@@ -37,21 +71,13 @@ app.get("/health", async (req, res) => {
   }
 });
 
-
 app.post("/api/contracts", async (req, res) => {
   try {
     const { config } = req.body;
+    if (!config) return res.status(400).json({ message: "config required" });
 
-    if (!config) {
-      return res.status(400).json({ message: "config required" });
-    }
-
-    // ✅ ดึง email จาก env
     const companyEmail = process.env.COMPANY_EMAIL;
-
-    // ❌ ถ้า env ไม่มา ให้ fail ทันที
     if (!companyEmail) {
-      console.error("❌ COMPANY_EMAIL is missing in .env");
       return res.status(500).json({
         message: "Server misconfiguration: COMPANY_EMAIL not set",
       });
@@ -59,40 +85,17 @@ app.post("/api/contracts", async (req, res) => {
 
     const documentId = "DOC-" + Date.now();
 
-    // ✅ log ให้เห็นชัด
-    console.log("CREATE CONTRACT");
-    console.log("documentId =", documentId);
-    console.log("companyEmail =", companyEmail);
-
-    const [result] = await db.query(
-      `
-      INSERT INTO contracts
-        (document_id, config, status, company_email)
-      VALUES (?, ?, ?, ?)
-      `,
-      [
-        documentId,
-        JSON.stringify(config),
-        "PENDING",
-        companyEmail,
-      ]
+    await db.query(
+      "INSERT INTO contracts (document_id, config, status, company_email) VALUES (?, ?, ?, ?)",
+      [documentId, JSON.stringify(config), "PENDING", companyEmail]
     );
 
-    console.log("INSERT RESULT =", result.insertId);
-
-    res.json({
-      documentId,
-      message: "Contract created successfully",
-    });
+    res.json({ documentId, message: "Contract created successfully" });
   } catch (err) {
-    console.error("❌ CREATE CONTRACT ERROR", err);
+    console.error(err);
     res.status(500).json({ message: "Create contract failed" });
   }
 });
-
-
-
-
 
 app.get("/api/contracts/:documentId", async (req, res) => {
   try {
@@ -103,9 +106,8 @@ app.get("/api/contracts/:documentId", async (req, res) => {
       [documentId]
     );
 
-    if (!rows.length) {
+    if (!rows.length)
       return res.status(404).json({ message: "Contract not found" });
-    }
 
     res.json({
       id: rows[0].id,
@@ -113,62 +115,69 @@ app.get("/api/contracts/:documentId", async (req, res) => {
       config: JSON.parse(rows[0].config),
       status: rows[0].status,
       createdAt: rows[0].created_at,
+      company_email: rows[0].company_email,
+      customer_email: rows[0].customer_email,
+      final_sent_at: rows[0].final_sent_at,
     });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ message: "Fetch contract failed" });
   }
 });
 
-
 app.get("/api/contracts/:documentId/signatures", async (req, res) => {
   const { documentId } = req.params;
-  
+
   try {
     const [signatures] = await db.query(
-      "SELECT role, signature_image FROM signatures WHERE contract_id = (SELECT id FROM contracts WHERE document_id = ?)",
+      `
+      SELECT role, signature_image, signer_role, signed_at
+      FROM signatures
+      WHERE contract_id = (SELECT id FROM contracts WHERE document_id = ?)
+      ORDER BY signed_at ASC
+      `,
       [documentId]
     );
 
     if (!signatures.length) {
-      return res.status(404).json({ message: "No signatures found for this contract" });
+      return res
+        .status(404)
+        .json({ message: "No signatures found for this contract" });
     }
 
     res.json({ signatures });
   } catch (err) {
-    console.error("Error fetching signatures:", err);
+    console.error(err);
     res.status(500).json({ message: "Fetch signatures failed" });
   }
 });
 
-
-
-
 app.post("/send-sign-email", async (req, res) => {
   try {
     const { email, documentId } = req.body;
-
     if (!email || !documentId) {
       return res.status(400).json({ message: "email & documentId required" });
     }
 
-    // 🔥 หา contract ก่อน
     const [rows] = await db.query(
       "SELECT id FROM contracts WHERE document_id = ?",
       [documentId]
     );
-
-    if (!rows.length) {
+    if (!rows.length)
       return res.status(404).json({ message: "Contract not found" });
-    }
 
     const contractId = rows[0].id;
 
-    const signLink = `http://localhost:5173/sign/${documentId}`;
+    await db.query("UPDATE contracts SET customer_email = ? WHERE id = ?", [
+      String(email).trim(),
+      contractId,
+    ]);
 
-    // ✅ ส่งเมล
+    const signLink = `${SIGN_LINK_BASE}/${documentId}`;
+
     await transporter.sendMail({
       from: `"E-Sign System" <${process.env.MAIL_USER}>`,
-      to: email,
+      to: String(email).trim(),
       subject: "กรุณาเซ็นเอกสาร",
       html: `
         <h3>กรุณาเซ็นเอกสาร</h3>
@@ -177,11 +186,10 @@ app.post("/send-sign-email", async (req, res) => {
       `,
     });
 
-    // ✅ log ด้วย id ที่ถูกต้อง
-    await db.query(
-      "INSERT INTO email_logs (contract_id, email) VALUES (?, ?)",
-      [contractId, email]
-    );
+    await db.query("INSERT INTO email_logs (contract_id, email) VALUES (?, ?)", [
+      contractId,
+      String(email).trim(),
+    ]);
 
     res.json({ message: "Email sent successfully" });
   } catch (err) {
@@ -190,7 +198,6 @@ app.post("/send-sign-email", async (req, res) => {
   }
 });
 
-/* ================= Customer Sign ================= */
 app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
   const { documentId } = req.params;
   const { signatures } = req.body;
@@ -204,7 +211,6 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
   try {
     await conn.beginTransaction();
 
-    // 1️⃣ หา contract + company_email
     const [contracts] = await conn.query(
       "SELECT id, company_email FROM contracts WHERE document_id = ?",
       [documentId]
@@ -217,19 +223,17 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
 
     const { id: contractId, company_email: companyEmail } = contracts[0];
 
-    // 2️⃣ บันทึกลายเซ็นลูกค้า
     for (const role of Object.keys(signatures)) {
       const image = signatures[role];
 
-      if (!image.startsWith("data:image/")) {
+      if (!isDataUrl(image)) {
         await conn.rollback();
         return res.status(400).json({ message: "Invalid signature image" });
       }
 
       await conn.query(
         `
-        INSERT INTO signatures
-          (contract_id, role, signature_image, signer_role)
+        INSERT INTO signatures (contract_id, role, signature_image, signer_role)
         VALUES (?, ?, ?, 'CUSTOMER')
         ON DUPLICATE KEY UPDATE
           signature_image = VALUES(signature_image),
@@ -239,21 +243,17 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
       );
     }
 
-    // 3️⃣ อัปเดตสถานะ
-    await conn.query(
-      "UPDATE contracts SET status = 'CUSTOMER_SIGNED' WHERE id = ?",
-      [contractId]
-    );
+    await conn.query("UPDATE contracts SET status = 'CUSTOMER_SIGNED' WHERE id = ?", [
+      contractId,
+    ]);
 
     await conn.commit();
 
-    // 4️⃣ 🔔 แจ้งบริษัท (ใช้ company_email โดยตรง)
     if (companyEmail) {
-      const adminLink = `http://localhost:5173/admin/sign/${documentId}`;
-
+      const adminLink = `${FRONTEND_BASE_URL}/admin/sign/${documentId}`;
       await transporter.sendMail({
         from: `"E-Sign System" <${process.env.MAIL_USER}>`,
-        to: companyEmail,
+        to: String(companyEmail).trim(),
         subject: "ลูกค้าเซ็นเอกสารเรียบร้อยแล้ว",
         html: `
           <h3>ลูกค้าได้เซ็นเอกสารเรียบร้อย</h3>
@@ -274,13 +274,9 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
   }
 });
 
-
-
-/* ================= Company Sign ================= */
 app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
   const { documentId } = req.params;
   const { signatures } = req.body;
-  // signatures = { "กรรมการ": "data:image/png;base64,..." }
 
   if (!signatures || typeof signatures !== "object") {
     return res.status(400).json({ message: "signatures required" });
@@ -291,9 +287,8 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
   try {
     await conn.beginTransaction();
 
-    // 1️⃣ หา contract
     const [contracts] = await conn.query(
-      "SELECT id, status FROM contracts WHERE document_id = ?",
+      "SELECT id, status, company_email, customer_email, final_sent_at FROM contracts WHERE document_id = ?",
       [documentId]
     );
 
@@ -306,45 +301,75 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
 
     if (contract.status !== "CUSTOMER_SIGNED") {
       await conn.rollback();
-      return res.status(400).json({
-        message: "Contract is not ready for company sign",
-      });
+      return res.status(400).json({ message: "Contract is not ready for company sign" });
     }
 
     const contractId = contract.id;
 
-    // 2️⃣ บันทึกลายเซ็นบริษัท
     for (const role of Object.keys(signatures)) {
       const image = signatures[role];
 
+      if (!isDataUrl(image)) {
+        await conn.rollback();
+        return res.status(400).json({ message: "Invalid signature image" });
+      }
+
       await conn.query(
         `
-        INSERT INTO signatures
-          (contract_id, role, signature_image, signer_role)
+        INSERT INTO signatures (contract_id, role, signature_image, signer_role)
         VALUES (?, ?, ?, 'COMPANY')
+        ON DUPLICATE KEY UPDATE
+          signature_image = VALUES(signature_image),
+          signed_at = CURRENT_TIMESTAMP
         `,
         [contractId, role, image]
       );
     }
 
-    // 3️⃣ อัปเดตสถานะเป็น COMPLETED
-    await conn.query(
-      "UPDATE contracts SET status = 'COMPLETED' WHERE id = ?",
-      [contractId]
-    );
+    await conn.query("UPDATE contracts SET status = 'COMPLETED' WHERE id = ?", [
+      contractId,
+    ]);
 
     await conn.commit();
 
-    res.json({ message: "Company signed successfully" });
-  } catch (err) {
-    await conn.rollback();
+    const toList = uniqEmails([contract.company_email, contract.customer_email]);
 
-    if (err.code === "ER_DUP_ENTRY") {
-      return res.status(409).json({
-        message: "Role นี้ถูกเซ็นไปแล้ว",
-      });
+    if (!toList.length) {
+      return res.json({ message: "Company signed successfully (no recipients)" });
     }
 
+    if (contract.final_sent_at) {
+      return res.json({ message: "Company signed successfully (PDF already sent)" });
+    }
+
+    const pdfUrl = `${FRONTEND_BASE_URL}${FINAL_VIEW_PATH}/${documentId}`;
+    const pdfBuffer = await renderPdfFromUrl(pdfUrl);
+
+    await transporter.sendMail({
+      from: `"E-Sign System" <${process.env.MAIL_USER}>`,
+      to: toList.join(","),
+      subject: "เอกสารเซ็นครบเรียบร้อยแล้ว ✅ (แนบ PDF)",
+      html: `
+        <h3>เอกสารถูกเซ็นครบเรียบร้อยแล้ว</h3>
+        <p>เลขที่เอกสาร: <b>${documentId}</b></p>
+        <p>แนบไฟล์ PDF ฉบับสมบูรณ์ไว้ในอีเมลนี้</p>
+      `,
+      attachments: [
+        {
+          filename: `${documentId}.pdf`,
+          content: pdfBuffer,
+          contentType: "application/pdf",
+        },
+      ],
+    });
+
+    await db.query("UPDATE contracts SET final_sent_at = CURRENT_TIMESTAMP WHERE id = ?", [
+      contractId,
+    ]);
+
+    res.json({ message: "Company signed successfully (PDF emailed)" });
+  } catch (err) {
+    await conn.rollback();
     console.error(err);
     res.status(500).json({ message: "Company sign failed" });
   } finally {
@@ -352,9 +377,6 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
   }
 });
 
-
-
-/* ================= Start Server ================= */
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`🚀 Backend running at http://localhost:${PORT}`);
