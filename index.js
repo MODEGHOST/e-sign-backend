@@ -60,6 +60,7 @@ async function renderPdfFromUrl(url) {
 
   try {
     const page = await browser.newPage();
+    // 794x1123 ~= A4 @ 96dpi; ใช้ scale 2 ให้คมขึ้น
     await page.setViewport({ width: 794, height: 1123, deviceScaleFactor: 2 });
     await page.emulateMediaType("print");
 
@@ -68,7 +69,7 @@ async function renderPdfFromUrl(url) {
     await page.waitForSelector(".a4-page", { timeout: 30000 });
     await page.evaluateHandle("document.fonts.ready");
 
-    // ----- PASS 1: Cover only (no header/footer) -----
+    // ===== PASS 1: ปก (ไม่มี header/footer) =====
     const coverBuffer = await page.pdf({
       preferCSSPageSize: true,
       printBackground: true,
@@ -78,44 +79,17 @@ async function renderPdfFromUrl(url) {
       pageRanges: "1",
     });
 
-    // ----- PASS 2: Content (with header + page numbers) -----
+    // ===== PASS 2: เนื้อหาทั้งหมด (ไม่มี header/footer) =====
     const contentBuffer = await page.pdf({
       preferCSSPageSize: true,
       printBackground: true,
       format: "A4",
-      margin: { top: "18mm", right: "10mm", bottom: "15mm", left: "10mm" },
-      displayHeaderFooter: true,
-      headerTemplate: `
-        <div style="
-          width:100%; height:14mm; background:#222; position:relative;
-          -webkit-print-color-adjust: exact; print-color-adjust: exact;
-        ">
-          <div style="
-            position:absolute; right:0; top:0; bottom:0; width:42mm;
-            background:linear-gradient(135deg,
-              transparent 0 28%,
-              #f39c12 28% 45%,
-              transparent 45% 55%,
-              #f39c12 55% 72%,
-              transparent 72% 100%
-            );
-          "></div>
-          <div style="position:absolute; left:0; right:0; bottom:0; height:1.5px; background:#fff; opacity:.9;"></div>
-        </div>
-      `,
-      footerTemplate: `
-        <div style="
-          width:100%; font-size:10px; color:#666;
-          padding-top:5px; border-top:1px solid #ddd;
-          text-align:right; padding-right:12mm;
-        ">
-          หน้า <span class="pageNumber"></span> / <span class="totalPages"></span>
-        </div>
-      `,
+      margin: { top: "0mm", right: "0mm", bottom: "0mm", left: "0mm" },
+      displayHeaderFooter: false,
       pageRanges: "2-",
     });
 
-    // ----- Merge PDFs: cover + content -----
+    // ===== Merge PDFs: ปก + เนื้อหา =====
     const coverPdf = await PDFDocument.load(coverBuffer);
     const contentPdf = await PDFDocument.load(contentBuffer);
 
@@ -137,7 +111,6 @@ async function renderPdfFromUrl(url) {
     await browser.close();
   }
 }
-
 
 // ---------- Routes ----------
 app.get("/health", async (req, res) => {
