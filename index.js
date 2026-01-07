@@ -4,12 +4,15 @@ const cors = require("cors");
 const mysql = require("mysql2/promise");
 const nodemailer = require("nodemailer");
 const puppeteer = require("puppeteer");
+const { PDFDocument } = require("pdf-lib");
 
 const app = express();
 
 app.use(cors());
-app.use(express.json());
+// ลายเซ็นเป็น dataURL ควรขยาย limit
+app.use(express.json({ limit: "15mb" }));
 
+// ---------- DB ----------
 const db = mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
@@ -17,6 +20,7 @@ const db = mysql.createPool({
   database: process.env.DB_NAME,
 });
 
+// ---------- Mail ----------
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
@@ -25,49 +29,137 @@ const transporter = nodemailer.createTransport({
   },
 });
 
+// ---------- Utils ----------
 const isDataUrl = (s) => typeof s === "string" && s.startsWith("data:image/");
-
 const uniqEmails = (arr) =>
   [...new Set((arr || []).map((s) => String(s || "").trim()).filter(Boolean))];
+const isEmail = (s) =>
+  /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s || "").trim());
 
 const FRONTEND_BASE_URL =
   process.env.FRONTEND_BASE_URL || "http://localhost:5173";
-
 const SIGN_LINK_BASE =
   process.env.SIGN_LINK_BASE || `${FRONTEND_BASE_URL}/sign`;
+const FINAL_VIEW_PATH = process.env.FINAL_VIEW_PATH || "/view-signed";
 
-const FINAL_VIEW_PATH =
-  process.env.FINAL_VIEW_PATH || "/view-signed";
+// ให้ตั้งได้ผ่าน .env ถ้าอยากบังคับใช้ Chrome ที่ติดตั้งไว้
+const PUPPETEER_EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
 
+// ---------- PDF render ----------
 async function renderPdfFromUrl(url) {
   const browser = await puppeteer.launch({
     headless: "new",
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    executablePath: PUPPETEER_EXECUTABLE_PATH,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+    ],
   });
 
   try {
     const page = await browser.newPage();
-    await page.setViewport({ width: 1240, height: 1754 });
-    await page.goto(url, { waitUntil: "networkidle0", timeout: 60000 });
+    await page.setViewport({ width: 794, height: 1123, deviceScaleFactor: 2 });
+    await page.emulateMediaType("print");
 
-    const pdfBuffer = await page.pdf({
-      format: "A4",
+    // โหลดหน้าให้เสถียร
+    await page.goto(url, { waitUntil: "networkidle0", timeout: 120000 });
+    await page.waitForSelector(".a4-page", { timeout: 30000 });
+    await page.evaluateHandle("document.fonts.ready");
+
+    // ----- PASS 1: Cover only (no header/footer) -----
+    const coverBuffer = await page.pdf({
+      preferCSSPageSize: true,
       printBackground: true,
-      margin: { top: "10mm", right: "10mm", bottom: "10mm", left: "10mm" },
+      format: "A4",
+      margin: { top: "0mm", right: "0mm", bottom: "0mm", left: "0mm" },
+      displayHeaderFooter: false,
+      pageRanges: "1",
     });
 
-    return pdfBuffer;
+    // ----- PASS 2: Content (with header + page numbers) -----
+    const contentBuffer = await page.pdf({
+      preferCSSPageSize: true,
+      printBackground: true,
+      format: "A4",
+      margin: { top: "18mm", right: "10mm", bottom: "15mm", left: "10mm" },
+      displayHeaderFooter: true,
+      headerTemplate: `
+        <div style="
+          width:100%; height:14mm; background:#222; position:relative;
+          -webkit-print-color-adjust: exact; print-color-adjust: exact;
+        ">
+          <div style="
+            position:absolute; right:0; top:0; bottom:0; width:42mm;
+            background:linear-gradient(135deg,
+              transparent 0 28%,
+              #f39c12 28% 45%,
+              transparent 45% 55%,
+              #f39c12 55% 72%,
+              transparent 72% 100%
+            );
+          "></div>
+          <div style="position:absolute; left:0; right:0; bottom:0; height:1.5px; background:#fff; opacity:.9;"></div>
+        </div>
+      `,
+      footerTemplate: `
+        <div style="
+          width:100%; font-size:10px; color:#666;
+          padding-top:5px; border-top:1px solid #ddd;
+          text-align:right; padding-right:12mm;
+        ">
+          หน้า <span class="pageNumber"></span> / <span class="totalPages"></span>
+        </div>
+      `,
+      pageRanges: "2-",
+    });
+
+    // ----- Merge PDFs: cover + content -----
+    const coverPdf = await PDFDocument.load(coverBuffer);
+    const contentPdf = await PDFDocument.load(contentBuffer);
+
+    // ถ้ามีแค่หน้าปก
+    if (contentPdf.getPageCount() === 0) {
+      return Buffer.from(await coverPdf.save());
+    }
+
+    const out = await PDFDocument.create();
+    const [coverPage] = await out.copyPages(coverPdf, [0]);
+    out.addPage(coverPage);
+
+    const contentPages = await out.copyPages(contentPdf, contentPdf.getPageIndices());
+    contentPages.forEach(p => out.addPage(p));
+
+    const merged = await out.save();
+    return Buffer.from(merged);
   } finally {
     await browser.close();
   }
 }
 
+
+// ---------- Routes ----------
 app.get("/health", async (req, res) => {
   try {
     await db.query("SELECT 1");
     res.json({ status: "ok", db: true });
   } catch (err) {
     res.status(500).json({ status: "error", error: err.message });
+  }
+});
+
+app.get("/health/puppeteer", async (req, res) => {
+  try {
+    const b = await puppeteer.launch({
+      headless: "new",
+      executablePath: PUPPETEER_EXECUTABLE_PATH,
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    });
+    await b.close();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
@@ -157,6 +249,9 @@ app.post("/send-sign-email", async (req, res) => {
     const { email, documentId } = req.body;
     if (!email || !documentId) {
       return res.status(400).json({ message: "email & documentId required" });
+    }
+    if (!isEmail(email)) {
+      return res.status(400).json({ message: "invalid email" });
     }
 
     const [rows] = await db.query(
@@ -301,7 +396,9 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
 
     if (contract.status !== "CUSTOMER_SIGNED") {
       await conn.rollback();
-      return res.status(400).json({ message: "Contract is not ready for company sign" });
+      return res
+        .status(400)
+        .json({ message: "Contract is not ready for company sign" });
     }
 
     const contractId = contract.id;
@@ -333,17 +430,29 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
     await conn.commit();
 
     const toList = uniqEmails([contract.company_email, contract.customer_email]);
-
     if (!toList.length) {
-      return res.json({ message: "Company signed successfully (no recipients)" });
+      return res.json({
+        message: "Company signed successfully (no recipients)",
+      });
     }
 
+    // กันส่งซ้ำเบื้องต้น
     if (contract.final_sent_at) {
-      return res.json({ message: "Company signed successfully (PDF already sent)" });
+      return res.json({
+        message: "Company signed successfully (PDF already sent)",
+      });
     }
 
     const pdfUrl = `${FRONTEND_BASE_URL}${FINAL_VIEW_PATH}/${documentId}`;
-    const pdfBuffer = await renderPdfFromUrl(pdfUrl);
+    let pdfBuffer;
+    try {
+      pdfBuffer = await renderPdfFromUrl(pdfUrl);
+    } catch (e) {
+      console.error("renderPdfFromUrl failed:", e);
+      return res
+        .status(500)
+        .json({ message: "Failed to render PDF", error: String(e.message || e) });
+    }
 
     await transporter.sendMail({
       from: `"E-Sign System" <${process.env.MAIL_USER}>`,
@@ -363,9 +472,18 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
       ],
     });
 
-    await db.query("UPDATE contracts SET final_sent_at = CURRENT_TIMESTAMP WHERE id = ?", [
-      contractId,
-    ]);
+    // อัปเดตแบบมีเงื่อนไข กันเรซบางส่วน
+    const [upd] = await db.query(
+      "UPDATE contracts SET final_sent_at = CURRENT_TIMESTAMP WHERE id = ? AND final_sent_at IS NULL",
+      [contractId]
+    );
+    if (upd.affectedRows === 0) {
+      // มีใครอัปเดตก่อนหน้าแล้ว แต่เมลเพิ่งส่งไปตอนนี้ — แจ้งเฉยๆ
+      return res.json({
+        message:
+          "Company signed successfully (PDF emailed, final_sent_at was already set)",
+      });
+    }
 
     res.json({ message: "Company signed successfully (PDF emailed)" });
   } catch (err) {
