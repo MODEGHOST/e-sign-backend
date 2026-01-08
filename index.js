@@ -6,11 +6,39 @@ const nodemailer = require("nodemailer");
 const puppeteer = require("puppeteer");
 const { PDFDocument } = require("pdf-lib");
 
+const fs = require("fs");
+const https = require("https");
+const { URL } = require("url");
+const crypto = require("crypto");
+
 const app = express();
 
 app.use(cors());
-// ลายเซ็นเป็น dataURL ควรขยาย limit
 app.use(express.json({ limit: "15mb" }));
+
+// ---------- Logger Helpers ----------
+function now() {
+  return new Date().toISOString();
+}
+function rid() {
+  return crypto.randomBytes(6).toString("hex"); // short request id
+}
+function log(reqId, ...args) {
+  console.log(`[${now()}][${reqId}]`, ...args);
+}
+function warn(reqId, ...args) {
+  console.warn(`[${now()}][${reqId}][WARN]`, ...args);
+}
+function errlog(reqId, ...args) {
+  console.error(`[${now()}][${reqId}][ERROR]`, ...args);
+}
+function redact(s) {
+  // กันเผลอ log ค่า secret ยาวๆ
+  if (!s) return "";
+  const str = String(s);
+  if (str.length <= 10) return "***";
+  return str.slice(0, 4) + "..." + str.slice(-4);
+}
 
 // ---------- DB ----------
 const db = mysql.createPool({
@@ -42,11 +70,49 @@ const SIGN_LINK_BASE =
   process.env.SIGN_LINK_BASE || `${FRONTEND_BASE_URL}/sign`;
 const FINAL_VIEW_PATH = process.env.FINAL_VIEW_PATH || "/view-signed";
 
-// ให้ตั้งได้ผ่าน .env ถ้าอยากบังคับใช้ Chrome ที่ติดตั้งไว้
-const PUPPETEER_EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
+// Puppeteer: allow override chrome path via env
+const PUPPETEER_EXECUTABLE_PATH =
+  process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
+
+// ---------- OneAuthen config ----------
+const ONEAUTHEN_ENABLED =
+  String(process.env.ONEAUTHEN_ENABLED || "false") === "true";
+const ONEAUTHEN_ENDPOINT =
+  process.env.ONEAUTHEN_ENDPOINT ||
+  "https://uat-sign.one.th/webservice/api/v2/signing/pdfSigning-V3";
+
+const ONEAUTHEN_CAD_DATA = process.env.ONEAUTHEN_CAD_DATA || "";
+const ONEAUTHEN_CERTIFY_LEVEL =
+  process.env.ONEAUTHEN_CERTIFY_LEVEL || "NON-CERTIFY";
+const ONEAUTHEN_VISIBLE_SIGNATURE =
+  process.env.ONEAUTHEN_VISIBLE_SIGNATURE || "Invisible";
+const ONEAUTHEN_OVERWRITE_ORIGINAL =
+  String(process.env.ONEAUTHEN_OVERWRITE_ORIGINAL || "true") === "true";
+
+const ONEAUTHEN_P12_PATH = process.env.ONEAUTHEN_P12_PATH || "";
+const ONEAUTHEN_P12_PASSPHRASE = process.env.ONEAUTHEN_P12_PASSPHRASE || "";
+const ONEAUTHEN_CERT_PATH = process.env.ONEAUTHEN_CERT_PATH || "";
+const ONEAUTHEN_KEY_PATH = process.env.ONEAUTHEN_KEY_PATH || "";
+const ONEAUTHEN_CA_PATH = process.env.ONEAUTHEN_CA_PATH || "";
+
+// ---------- Boot logs ----------
+console.log("========================================");
+console.log("🚀 Backend starting...");
+console.log("PORT:", process.env.PORT || 4000);
+console.log("FRONTEND_BASE_URL:", FRONTEND_BASE_URL);
+console.log("FINAL_VIEW_PATH:", FINAL_VIEW_PATH);
+console.log("ONEAUTHEN_ENABLED:", ONEAUTHEN_ENABLED);
+console.log("ONEAUTHEN_ENDPOINT:", ONEAUTHEN_ENDPOINT);
+console.log("ONEAUTHEN_CAD_DATA:", ONEAUTHEN_CAD_DATA ? redact(ONEAUTHEN_CAD_DATA) : "(empty)");
+console.log("mTLS using:", ONEAUTHEN_P12_PATH ? ".p12" : ".cert+.key");
+console.log("ONEAUTHEN_P12_PATH:", ONEAUTHEN_P12_PATH || "(empty)");
+console.log("========================================");
 
 // ---------- PDF render ----------
-async function renderPdfFromUrl(url) {
+async function renderPdfFromUrl(url, reqId = "sys") {
+  log(reqId, "🖨️ renderPdfFromUrl start:", url);
+  const t0 = Date.now();
+
   const browser = await puppeteer.launch({
     headless: "new",
     executablePath: PUPPETEER_EXECUTABLE_PATH,
@@ -60,16 +126,13 @@ async function renderPdfFromUrl(url) {
 
   try {
     const page = await browser.newPage();
-    // 794x1123 ~= A4 @ 96dpi; ใช้ scale 2 ให้คมขึ้น
     await page.setViewport({ width: 794, height: 1123, deviceScaleFactor: 2 });
     await page.emulateMediaType("print");
 
-    // โหลดหน้าให้เสถียร
     await page.goto(url, { waitUntil: "networkidle0", timeout: 120000 });
     await page.waitForSelector(".a4-page", { timeout: 30000 });
     await page.evaluateHandle("document.fonts.ready");
 
-    // ===== PASS 1: ปก (ไม่มี header/footer) =====
     const coverBuffer = await page.pdf({
       preferCSSPageSize: true,
       printBackground: true,
@@ -79,7 +142,6 @@ async function renderPdfFromUrl(url) {
       pageRanges: "1",
     });
 
-    // ===== PASS 2: เนื้อหาทั้งหมด (ไม่มี header/footer) =====
     const contentBuffer = await page.pdf({
       preferCSSPageSize: true,
       printBackground: true,
@@ -89,40 +151,201 @@ async function renderPdfFromUrl(url) {
       pageRanges: "2-",
     });
 
-    // ===== Merge PDFs: ปก + เนื้อหา =====
     const coverPdf = await PDFDocument.load(coverBuffer);
     const contentPdf = await PDFDocument.load(contentBuffer);
 
-    // ถ้ามีแค่หน้าปก
     if (contentPdf.getPageCount() === 0) {
-      return Buffer.from(await coverPdf.save());
+      const outBuf = Buffer.from(await coverPdf.save());
+      log(reqId, "🖨️ renderPdfFromUrl done (cover only), size:", outBuf.length, "bytes, ms:", Date.now() - t0);
+      return outBuf;
     }
 
     const out = await PDFDocument.create();
     const [coverPage] = await out.copyPages(coverPdf, [0]);
     out.addPage(coverPage);
 
-    const contentPages = await out.copyPages(contentPdf, contentPdf.getPageIndices());
-    contentPages.forEach(p => out.addPage(p));
+    const contentPages = await out.copyPages(
+      contentPdf,
+      contentPdf.getPageIndices()
+    );
+    contentPages.forEach((p) => out.addPage(p));
 
-    const merged = await out.save();
-    return Buffer.from(merged);
+    const outBuf = Buffer.from(await out.save());
+    log(reqId, "🖨️ renderPdfFromUrl done, pages:", 1 + contentPdf.getPageCount(), "size:", outBuf.length, "bytes, ms:", Date.now() - t0);
+    return outBuf;
   } finally {
     await browser.close();
   }
 }
 
+// ---------- OneAuthen: HTTPS mTLS helper ----------
+function buildOneAuthenAgent(reqId = "sys") {
+  const agentOptions = { keepAlive: true };
+
+  if (ONEAUTHEN_P12_PATH) {
+    if (!fs.existsSync(ONEAUTHEN_P12_PATH)) {
+      throw new Error(`ONEAUTHEN_P12_PATH not found: ${ONEAUTHEN_P12_PATH}`);
+    }
+    log(reqId, "🔐 mTLS using P12:", ONEAUTHEN_P12_PATH);
+    agentOptions.pfx = fs.readFileSync(ONEAUTHEN_P12_PATH);
+    agentOptions.passphrase = ONEAUTHEN_P12_PASSPHRASE || undefined;
+  } else {
+    if (!ONEAUTHEN_CERT_PATH || !ONEAUTHEN_KEY_PATH) {
+      throw new Error(
+        "Missing mTLS cert config: set ONEAUTHEN_P12_PATH or (ONEAUTHEN_CERT_PATH + ONEAUTHEN_KEY_PATH)"
+      );
+    }
+    if (!fs.existsSync(ONEAUTHEN_CERT_PATH)) {
+      throw new Error(`ONEAUTHEN_CERT_PATH not found: ${ONEAUTHEN_CERT_PATH}`);
+    }
+    if (!fs.existsSync(ONEAUTHEN_KEY_PATH)) {
+      throw new Error(`ONEAUTHEN_KEY_PATH not found: ${ONEAUTHEN_KEY_PATH}`);
+    }
+    log(reqId, "🔐 mTLS using CERT+KEY:", ONEAUTHEN_CERT_PATH, ONEAUTHEN_KEY_PATH);
+    agentOptions.cert = fs.readFileSync(ONEAUTHEN_CERT_PATH);
+    agentOptions.key = fs.readFileSync(ONEAUTHEN_KEY_PATH);
+  }
+
+  if (ONEAUTHEN_CA_PATH) {
+    if (!fs.existsSync(ONEAUTHEN_CA_PATH)) {
+      throw new Error(`ONEAUTHEN_CA_PATH not found: ${ONEAUTHEN_CA_PATH}`);
+    }
+    log(reqId, "🔐 mTLS using CA chain:", ONEAUTHEN_CA_PATH);
+    agentOptions.ca = fs.readFileSync(ONEAUTHEN_CA_PATH);
+  }
+
+  return new https.Agent(agentOptions);
+}
+
+function httpsJsonRequest(urlString, bodyObj, agent, timeoutMs = 120000, reqId = "sys") {
+  const u = new URL(urlString);
+  const body = Buffer.from(JSON.stringify(bodyObj), "utf8");
+
+  const options = {
+    hostname: u.hostname,
+    port: u.port || 443,
+    path: u.pathname + (u.search || ""),
+    method: "POST",
+    agent,
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": body.length,
+    },
+  };
+
+  return new Promise((resolve, reject) => {
+    const t0 = Date.now();
+    const req = https.request(options, (res) => {
+      const chunks = [];
+      res.on("data", (d) => chunks.push(d));
+      res.on("end", () => {
+        const buf = Buffer.concat(chunks);
+        log(reqId, "🌐 OneAuthen HTTP done:", res.statusCode, "ct:", res.headers["content-type"] || "-", "bytes:", buf.length, "ms:", Date.now() - t0);
+        resolve({
+          statusCode: res.statusCode,
+          headers: res.headers,
+          buffer: buf,
+        });
+      });
+    });
+
+    req.on("error", (e) => {
+      errlog(reqId, "🌐 OneAuthen HTTP error:", e.message || e);
+      reject(e);
+    });
+
+    req.setTimeout(timeoutMs, () => {
+      errlog(reqId, "🌐 OneAuthen HTTP timeout:", timeoutMs, "ms");
+      req.destroy(new Error("OneAuthen request timeout"));
+    });
+
+    req.write(body);
+    req.end();
+  });
+}
+
+async function signPdfWithOneAuthen(pdfBuffer, reqId = "sys") {
+  if (!ONEAUTHEN_CAD_DATA) {
+    throw new Error("ONEAUTHEN_CAD_DATA is required (CAD จากทีม oneauthen)");
+  }
+
+  log(reqId, "🔏 signPdfWithOneAuthen start. pdf bytes:", pdfBuffer.length);
+  log(reqId, "🔏 endpoint:", ONEAUTHEN_ENDPOINT);
+  log(reqId, "🔏 certifyLevel:", ONEAUTHEN_CERTIFY_LEVEL, "visibleSignature:", ONEAUTHEN_VISIBLE_SIGNATURE, "overwriteOriginal:", ONEAUTHEN_OVERWRITE_ORIGINAL);
+
+  const agent = buildOneAuthenAgent(reqId);
+
+  const payload = {
+    pdfData: pdfBuffer.toString("base64"),
+    cadData: ONEAUTHEN_CAD_DATA,
+    certifyLevel: ONEAUTHEN_CERTIFY_LEVEL,
+  };
+
+  if (ONEAUTHEN_VISIBLE_SIGNATURE) payload.visibleSignature = ONEAUTHEN_VISIBLE_SIGNATURE;
+  if (typeof ONEAUTHEN_OVERWRITE_ORIGINAL === "boolean")
+    payload.overwriteOriginal = ONEAUTHEN_OVERWRITE_ORIGINAL;
+
+  const resp = await httpsJsonRequest(ONEAUTHEN_ENDPOINT, payload, agent, 120000, reqId);
+  const ct = String(resp.headers["content-type"] || "").toLowerCase();
+
+  // ถ้า status ไม่ใช่ 2xx ให้ log ตัวอย่าง body สั้นๆ (ช่วย debug)
+  if (!(resp.statusCode >= 200 && resp.statusCode < 300)) {
+    const preview = resp.buffer.toString("utf8").slice(0, 400);
+    warn(reqId, "⚠️ OneAuthen non-2xx:", resp.statusCode, "body preview:", preview);
+  }
+
+  if (ct.includes("application/pdf")) {
+    log(reqId, "✅ OneAuthen returned PDF binary. bytes:", resp.buffer.length);
+    return resp.buffer;
+  }
+
+  let json;
+  try {
+    json = JSON.parse(resp.buffer.toString("utf8"));
+  } catch (e) {
+    throw new Error(
+      `OneAuthen unexpected response (status=${resp.statusCode}, content-type=${ct}): ${resp.buffer
+        .toString("utf8")
+        .slice(0, 500)}`
+    );
+  }
+
+  const base64 =
+    json.pdfData ||
+    json.pdfBase64 ||
+    json.data?.pdfData ||
+    json.result?.pdfData ||
+    null;
+
+  if (!base64) {
+    throw new Error(
+      `OneAuthen response has no pdfData (status=${resp.statusCode}): ${JSON.stringify(json).slice(
+        0,
+        500
+      )}`
+    );
+  }
+
+  const out = Buffer.from(String(base64), "base64");
+  log(reqId, "✅ OneAuthen returned pdfData(base64). bytes:", out.length);
+  return out;
+}
+
 // ---------- Routes ----------
 app.get("/health", async (req, res) => {
+  const reqId = rid();
   try {
     await db.query("SELECT 1");
+    log(reqId, "✅ /health ok");
     res.json({ status: "ok", db: true });
-  } catch (err) {
-    res.status(500).json({ status: "error", error: err.message });
+  } catch (e) {
+    errlog(reqId, "❌ /health db error:", e.message || e);
+    res.status(500).json({ status: "error", error: e.message });
   }
 });
 
 app.get("/health/puppeteer", async (req, res) => {
+  const reqId = rid();
   try {
     const b = await puppeteer.launch({
       headless: "new",
@@ -130,13 +353,52 @@ app.get("/health/puppeteer", async (req, res) => {
       args: ["--no-sandbox", "--disable-setuid-sandbox"],
     });
     await b.close();
+    log(reqId, "✅ /health/puppeteer ok");
     res.json({ ok: true });
   } catch (e) {
+    errlog(reqId, "❌ /health/puppeteer error:", e.message || e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
+// เทสว่า mTLS ต่อ OneAuthen ได้ไหม (ยิง request แบบ dummy)
+app.get("/health/oneauthen", async (req, res) => {
+  const reqId = rid();
+  try {
+    log(reqId, "➡️ /health/oneauthen called. enabled =", ONEAUTHEN_ENABLED);
+
+    if (!ONEAUTHEN_ENABLED) {
+      return res.json({ ok: true, enabled: false, note: "ONEAUTHEN_ENABLED=false" });
+    }
+
+    const agent = buildOneAuthenAgent(reqId);
+
+    const payload = {
+      pdfData: "AA==",
+      cadData: ONEAUTHEN_CAD_DATA || "MISSING_CAD",
+      certifyLevel: ONEAUTHEN_CERTIFY_LEVEL,
+      visibleSignature: ONEAUTHEN_VISIBLE_SIGNATURE,
+      overwriteOriginal: ONEAUTHEN_OVERWRITE_ORIGINAL,
+    };
+
+    const resp = await httpsJsonRequest(ONEAUTHEN_ENDPOINT, payload, agent, 30000, reqId);
+
+    log(reqId, "✅ /health/oneauthen done:", resp.statusCode, resp.headers["content-type"] || "-");
+
+    res.json({
+      ok: true,
+      enabled: true,
+      statusCode: resp.statusCode,
+      contentType: resp.headers["content-type"] || null,
+    });
+  } catch (e) {
+    errlog(reqId, "❌ /health/oneauthen error:", e.message || e);
+    res.status(500).json({ ok: false, enabled: ONEAUTHEN_ENABLED, error: String(e.message || e) });
+  }
+});
+
 app.post("/api/contracts", async (req, res) => {
+  const reqId = rid();
   try {
     const { config } = req.body;
     if (!config) return res.status(400).json({ message: "config required" });
@@ -149,31 +411,30 @@ app.post("/api/contracts", async (req, res) => {
     }
 
     const documentId = "DOC-" + Date.now();
-
     await db.query(
       "INSERT INTO contracts (document_id, config, status, company_email) VALUES (?, ?, ?, ?)",
       [documentId, JSON.stringify(config), "PENDING", companyEmail]
     );
 
+    log(reqId, "✅ Contract created:", documentId);
     res.json({ documentId, message: "Contract created successfully" });
-  } catch (err) {
-    console.error(err);
+  } catch (e) {
+    errlog(reqId, "❌ Create contract failed:", e.message || e);
     res.status(500).json({ message: "Create contract failed" });
   }
 });
 
 app.get("/api/contracts/:documentId", async (req, res) => {
+  const reqId = rid();
   try {
     const { documentId } = req.params;
-
     const [rows] = await db.query(
       "SELECT * FROM contracts WHERE document_id = ?",
       [documentId]
     );
+    if (!rows.length) return res.status(404).json({ message: "Contract not found" });
 
-    if (!rows.length)
-      return res.status(404).json({ message: "Contract not found" });
-
+    log(reqId, "✅ Get contract:", documentId, "status:", rows[0].status);
     res.json({
       id: rows[0].id,
       documentId: rows[0].document_id,
@@ -184,13 +445,14 @@ app.get("/api/contracts/:documentId", async (req, res) => {
       customer_email: rows[0].customer_email,
       final_sent_at: rows[0].final_sent_at,
     });
-  } catch (err) {
-    console.error(err);
+  } catch (e) {
+    errlog(reqId, "❌ Fetch contract failed:", e.message || e);
     res.status(500).json({ message: "Fetch contract failed" });
   }
 });
 
 app.get("/api/contracts/:documentId/signatures", async (req, res) => {
+  const reqId = rid();
   const { documentId } = req.params;
 
   try {
@@ -205,19 +467,20 @@ app.get("/api/contracts/:documentId/signatures", async (req, res) => {
     );
 
     if (!signatures.length) {
-      return res
-        .status(404)
-        .json({ message: "No signatures found for this contract" });
+      warn(reqId, "No signatures for:", documentId);
+      return res.status(404).json({ message: "No signatures found for this contract" });
     }
 
+    log(reqId, "✅ Signatures fetched:", documentId, "count:", signatures.length);
     res.json({ signatures });
-  } catch (err) {
-    console.error(err);
+  } catch (e) {
+    errlog(reqId, "❌ Fetch signatures failed:", e.message || e);
     res.status(500).json({ message: "Fetch signatures failed" });
   }
 });
 
 app.post("/send-sign-email", async (req, res) => {
+  const reqId = rid();
   try {
     const { email, documentId } = req.body;
     if (!email || !documentId) {
@@ -231,8 +494,7 @@ app.post("/send-sign-email", async (req, res) => {
       "SELECT id FROM contracts WHERE document_id = ?",
       [documentId]
     );
-    if (!rows.length)
-      return res.status(404).json({ message: "Contract not found" });
+    if (!rows.length) return res.status(404).json({ message: "Contract not found" });
 
     const contractId = rows[0].id;
 
@@ -242,6 +504,8 @@ app.post("/send-sign-email", async (req, res) => {
     ]);
 
     const signLink = `${SIGN_LINK_BASE}/${documentId}`;
+
+    log(reqId, "📧 Sending sign email to:", email, "doc:", documentId);
 
     await transporter.sendMail({
       from: `"E-Sign System" <${process.env.MAIL_USER}>`,
@@ -259,14 +523,16 @@ app.post("/send-sign-email", async (req, res) => {
       String(email).trim(),
     ]);
 
+    log(reqId, "✅ Email sent:", email, "doc:", documentId);
     res.json({ message: "Email sent successfully" });
-  } catch (err) {
-    console.error(err);
+  } catch (e) {
+    errlog(reqId, "❌ Send email failed:", e.message || e);
     res.status(500).json({ message: "Send email failed" });
   }
 });
 
 app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
+  const reqId = rid();
   const { documentId } = req.params;
   const { signatures } = req.body;
 
@@ -277,6 +543,7 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
   const conn = await db.getConnection();
 
   try {
+    log(reqId, "✍️ Customer sign start:", documentId, "roles:", Object.keys(signatures).join(","));
     await conn.beginTransaction();
 
     const [contracts] = await conn.query(
@@ -293,7 +560,6 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
 
     for (const role of Object.keys(signatures)) {
       const image = signatures[role];
-
       if (!isDataUrl(image)) {
         await conn.rollback();
         return res.status(400).json({ message: "Invalid signature image" });
@@ -311,14 +577,18 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
       );
     }
 
-    await conn.query("UPDATE contracts SET status = 'CUSTOMER_SIGNED' WHERE id = ?", [
-      contractId,
-    ]);
+    await conn.query(
+      "UPDATE contracts SET status = 'CUSTOMER_SIGNED' WHERE id = ?",
+      [contractId]
+    );
 
     await conn.commit();
+    log(reqId, "✅ Customer sign committed:", documentId);
 
     if (companyEmail) {
       const adminLink = `${FRONTEND_BASE_URL}/admin/sign/${documentId}`;
+      log(reqId, "📧 Notify company:", companyEmail, "adminLink:", adminLink);
+
       await transporter.sendMail({
         from: `"E-Sign System" <${process.env.MAIL_USER}>`,
         to: String(companyEmail).trim(),
@@ -333,9 +603,9 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
     }
 
     res.json({ message: "Customer signed successfully" });
-  } catch (err) {
+  } catch (e) {
     await conn.rollback();
-    console.error(err);
+    errlog(reqId, "❌ Customer sign failed:", e.message || e);
     res.status(500).json({ message: "Customer sign failed" });
   } finally {
     conn.release();
@@ -343,6 +613,7 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
 });
 
 app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
+  const reqId = rid();
   const { documentId } = req.params;
   const { signatures } = req.body;
 
@@ -353,6 +624,7 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
   const conn = await db.getConnection();
 
   try {
+    log(reqId, "🏢 Company sign start:", documentId, "roles:", Object.keys(signatures).join(","));
     await conn.beginTransaction();
 
     const [contracts] = await conn.query(
@@ -369,16 +641,14 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
 
     if (contract.status !== "CUSTOMER_SIGNED") {
       await conn.rollback();
-      return res
-        .status(400)
-        .json({ message: "Contract is not ready for company sign" });
+      warn(reqId, "❌ Not ready for company sign. status =", contract.status);
+      return res.status(400).json({ message: "Contract is not ready for company sign" });
     }
 
     const contractId = contract.id;
 
     for (const role of Object.keys(signatures)) {
       const image = signatures[role];
-
       if (!isDataUrl(image)) {
         await conn.rollback();
         return res.status(400).json({ message: "Invalid signature image" });
@@ -401,31 +671,50 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
     ]);
 
     await conn.commit();
+    log(reqId, "✅ Company sign committed:", documentId);
 
     const toList = uniqEmails([contract.company_email, contract.customer_email]);
     if (!toList.length) {
-      return res.json({
-        message: "Company signed successfully (no recipients)",
-      });
+      warn(reqId, "No recipients, finish without email.");
+      return res.json({ message: "Company signed successfully (no recipients)" });
     }
 
-    // กันส่งซ้ำเบื้องต้น
     if (contract.final_sent_at) {
-      return res.json({
-        message: "Company signed successfully (PDF already sent)",
-      });
+      warn(reqId, "PDF already sent before. final_sent_at =", contract.final_sent_at);
+      return res.json({ message: "Company signed successfully (PDF already sent)" });
     }
 
+    // 1) Render PDF
     const pdfUrl = `${FRONTEND_BASE_URL}${FINAL_VIEW_PATH}/${documentId}`;
+    log(reqId, "🧾 Rendering PDF from:", pdfUrl);
+
     let pdfBuffer;
     try {
-      pdfBuffer = await renderPdfFromUrl(pdfUrl);
+      pdfBuffer = await renderPdfFromUrl(pdfUrl, reqId);
     } catch (e) {
-      console.error("renderPdfFromUrl failed:", e);
-      return res
-        .status(500)
-        .json({ message: "Failed to render PDF", error: String(e.message || e) });
+      errlog(reqId, "renderPdfFromUrl failed:", e.message || e);
+      return res.status(500).json({ message: "Failed to render PDF", error: String(e.message || e) });
     }
+
+    // 2) OneAuthen sign
+    if (ONEAUTHEN_ENABLED) {
+      log(reqId, "🔐 OneAuthen enabled => signing PDF...");
+      try {
+        pdfBuffer = await signPdfWithOneAuthen(pdfBuffer, reqId);
+      } catch (e) {
+        errlog(reqId, "OneAuthen signing failed:", e.message || e);
+        return res.status(500).json({
+          message: "Failed to sign PDF with OneAuthen",
+          error: String(e.message || e),
+        });
+      }
+      log(reqId, "🎉 OneAuthen sign success. signed pdf bytes:", pdfBuffer.length);
+    } else {
+      warn(reqId, "🔕 OneAuthen disabled, skipping sign.");
+    }
+
+    // 3) Email PDF
+    log(reqId, "📨 Sending final PDF email to:", toList.join(","));
 
     await transporter.sendMail({
       from: `"E-Sign System" <${process.env.MAIL_USER}>`,
@@ -435,6 +724,7 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
         <h3>เอกสารถูกเซ็นครบเรียบร้อยแล้ว</h3>
         <p>เลขที่เอกสาร: <b>${documentId}</b></p>
         <p>แนบไฟล์ PDF ฉบับสมบูรณ์ไว้ในอีเมลนี้</p>
+        <p>OneAuthen enabled: <b>${ONEAUTHEN_ENABLED}</b></p>
       `,
       attachments: [
         {
@@ -445,23 +735,25 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
       ],
     });
 
-    // อัปเดตแบบมีเงื่อนไข กันเรซบางส่วน
     const [upd] = await db.query(
       "UPDATE contracts SET final_sent_at = CURRENT_TIMESTAMP WHERE id = ? AND final_sent_at IS NULL",
       [contractId]
     );
+
     if (upd.affectedRows === 0) {
-      // มีใครอัปเดตก่อนหน้าแล้ว แต่เมลเพิ่งส่งไปตอนนี้ — แจ้งเฉยๆ
+      warn(reqId, "final_sent_at already set by another process.");
       return res.json({
-        message:
-          "Company signed successfully (PDF emailed, final_sent_at was already set)",
+        message: "Company signed successfully (PDF emailed, final_sent_at was already set)",
       });
     }
 
-    res.json({ message: "Company signed successfully (PDF emailed)" });
-  } catch (err) {
+    log(reqId, "✅ Final PDF emailed + final_sent_at updated. Done.");
+    res.json({
+      message: `Company signed successfully (PDF emailed${ONEAUTHEN_ENABLED ? ", OneAuthen signed" : ""})`,
+    });
+  } catch (e) {
     await conn.rollback();
-    console.error(err);
+    errlog(reqId, "❌ Company sign failed:", e.message || e);
     res.status(500).json({ message: "Company sign failed" });
   } finally {
     conn.release();
