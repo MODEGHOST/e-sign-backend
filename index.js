@@ -332,17 +332,18 @@ async function signPdfWithOneAuthen(pdfBuffer, reqId = "sys") {
 }
 
 // ---------- Routes ----------
-app.get("/health", async (req, res) => {
+app.get("/api/health", async (req, res) => {
   const reqId = rid();
   try {
     await db.query("SELECT 1");
-    log(reqId, "✅ /health ok");
+    log(reqId, "✅ /api/health ok");
     res.json({ status: "ok", db: true });
   } catch (e) {
-    errlog(reqId, "❌ /health db error:", e.message || e);
+    errlog(reqId, "❌ /api/health db error:", e.message || e);
     res.status(500).json({ status: "error", error: e.message });
   }
 });
+
 
 app.get("/health/puppeteer", async (req, res) => {
   const reqId = rid();
@@ -479,7 +480,7 @@ app.get("/api/contracts/:documentId/signatures", async (req, res) => {
   }
 });
 
-app.post("/send-sign-email", async (req, res) => {
+app.post("/api/send-sign-email", async (req, res) => {
   const reqId = rid();
   try {
     const { email, documentId } = req.body;
