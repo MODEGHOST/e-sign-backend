@@ -544,11 +544,18 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
   const conn = await db.getConnection();
 
   try {
-    log(reqId, "✍️ Customer sign start:", documentId, "roles:", Object.keys(signatures).join(","));
+    log(
+      reqId,
+      "✍️ Customer sign start:",
+      documentId,
+      "roles:",
+      Object.keys(signatures).join(",")
+    );
+
     await conn.beginTransaction();
 
     const [contracts] = await conn.query(
-      "SELECT id, company_email FROM contracts WHERE document_id = ?",
+      "SELECT id, status, company_email FROM contracts WHERE document_id = ?",
       [documentId]
     );
 
@@ -557,13 +564,23 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
       return res.status(404).json({ message: "Contract not found" });
     }
 
-    const { id: contractId, company_email: companyEmail } = contracts[0];
+    const contract = contracts[0];
+    const contractId = contract.id;
+    const companyEmail = contract.company_email;
+
+    if (contract.status === "CUSTOMER_SIGNED" || contract.status === "COMPLETED") {
+      await conn.rollback();
+      warn(reqId, "❌ Customer already signed. status =", contract.status);
+      return res.status(409).json({ message: "Customer already signed" });
+    }
 
     for (const role of Object.keys(signatures)) {
       const image = signatures[role];
       if (!isDataUrl(image)) {
         await conn.rollback();
-        return res.status(400).json({ message: "Invalid signature image" });
+        return res
+          .status(400)
+          .json({ message: `Invalid signature image for role: ${role}` });
       }
 
       await conn.query(
@@ -578,17 +595,16 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
       );
     }
 
-    await conn.query(
-      "UPDATE contracts SET status = 'CUSTOMER_SIGNED' WHERE id = ?",
-      [contractId]
-    );
+    await conn.query("UPDATE contracts SET status = 'CUSTOMER_SIGNED' WHERE id = ?", [
+      contractId,
+    ]);
 
     await conn.commit();
     log(reqId, "✅ Customer sign committed:", documentId);
 
     if (companyEmail) {
       const adminLink = `${FRONTEND_BASE_URL}/admin/sign/${documentId}`;
-      log(reqId, "📧 Notify company:", companyEmail, "adminLink:", adminLink);
+      log(reqId, "📧 Notify company:", String(companyEmail).trim(), "adminLink:", adminLink);
 
       await transporter.sendMail({
         from: `"E-Sign System" <${process.env.MAIL_USER}>`,
@@ -603,15 +619,16 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
       });
     }
 
-    res.json({ message: "Customer signed successfully" });
+    return res.json({ message: "Customer signed successfully" });
   } catch (e) {
     await conn.rollback();
     errlog(reqId, "❌ Customer sign failed:", e.message || e);
-    res.status(500).json({ message: "Customer sign failed" });
+    return res.status(500).json({ message: "Customer sign failed" });
   } finally {
     conn.release();
   }
 });
+
 
 app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
   const reqId = rid();
