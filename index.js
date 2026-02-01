@@ -33,7 +33,6 @@ function errlog(reqId, ...args) {
   console.error(`[${now()}][${reqId}][ERROR]`, ...args);
 }
 function redact(s) {
-  // กันเผลอ log ค่า secret ยาวๆ
   if (!s) return "";
   const str = String(s);
   if (str.length <= 10) return "***";
@@ -46,6 +45,9 @@ const db = mysql.createPool({
   user: process.env.DB_USER,
   password: process.env.DB_PASS || "",
   database: process.env.DB_NAME,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
 });
 
 // ---------- Mail ----------
@@ -59,10 +61,100 @@ const transporter = nodemailer.createTransport({
 
 // ---------- Utils ----------
 const isDataUrl = (s) => typeof s === "string" && s.startsWith("data:image/");
-const uniqEmails = (arr) =>
-  [...new Set((arr || []).map((s) => String(s || "").trim()).filter(Boolean))];
+const uniqEmails = (arr) => [
+  ...new Set((arr || []).map((s) => String(s || "").trim()).filter(Boolean)),
+];
 const isEmail = (s) =>
   /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s || "").trim());
+
+function safeStr(s, max = 255) {
+  if (s == null) return null;
+  const v = String(s).trim();
+  if (!v) return null;
+  return v.length > max ? v.slice(0, max) : v;
+}
+
+/**
+ * รองรับ 2 แบบ
+ * 1) signatures: { role: "data:image/..." }
+ * 2) signatures: { role: { image: "data:image/...", name: "...", position: "..." } }
+ */
+function normalizeSignaturesPayload(signatures) {
+  const out = [];
+  if (!signatures || typeof signatures !== "object") return out;
+
+  for (const role of Object.keys(signatures)) {
+    const v = signatures[role];
+
+    if (typeof v === "string") {
+      out.push({ role, image: v, name: null, position: null });
+      continue;
+    }
+
+    if (v && typeof v === "object") {
+      const image = v.image || v.signature_image || v.dataUrl || null;
+      const name = safeStr(v.name, 100);
+      const position = safeStr(v.position, 255);
+      out.push({ role, image, name, position });
+      continue;
+    }
+
+    out.push({ role, image: null, name: null, position: null });
+  }
+
+  return out;
+}
+
+function validateRoleBasic(role) {
+  if (!role || typeof role !== "string") return false;
+  if (role.length > 100) return false;
+  return true;
+}
+
+/**
+ * ดึง role ที่ "ต้องเซ็น" จาก config.signatures (array)
+ * โดยใช้ field: role หรือ id (แล้วแต่คุณเก็บ)
+ * - ถ้าคุณใช้ role ใน config.signatures ให้มันอ่าน role ก่อน
+ * - ถ้าไม่เจอ role จะ fallback ใช้ id
+ */
+function extractRequiredRolesFromConfig(config) {
+  const sigs = Array.isArray(config?.signatures) ? config.signatures : [];
+  const roles = [];
+
+  for (const s of sigs) {
+    const r = safeStr(s?.role, 100) || safeStr(s?.id, 100);
+    if (r) roles.push(r);
+  }
+
+  // unique
+  return [...new Set(roles)];
+}
+
+/**
+ * แบ่ง required roles ต่อ signer_role (CUSTOMER/COMPANY)
+ * rule: ใช้ prefix จาก role (ปรับได้ตาม naming ที่คุณใช้จริง)
+ * - ถ้า role มีคำว่า customer => CUSTOMER
+ * - ถ้า role มีคำว่า company  => COMPANY
+ * - ถ้าไม่เข้าเงื่อนไข: ใส่รวม (ทั้งสอง) หรือคุณจะบังคับ pattern ก็ได้
+ */
+function splitRolesBySigner(requiredRoles) {
+  const customer = [];
+  const company = [];
+
+  for (const r of requiredRoles) {
+    const low = String(r).toLowerCase();
+    if (low.includes("customer")) customer.push(r);
+    else if (low.includes("company")) company.push(r);
+    else {
+      // fallback: ถ้าคุณตั้ง role ไม่เป็น prefix
+      // ให้ถือว่าเป็น role ที่ต้องเซ็นทั้ง 2 ฝั่งไม่ได้
+      // แต่เพื่อกันพัง เราจะ "ไม่ใส่" ในฝั่งใดฝั่งหนึ่งแบบสุ่ม
+      // => แนะนำให้ตั้ง role ให้ชัด เช่น customer_director / company_witness
+    }
+  }
+
+  return { customer, company };
+}
 
 const FRONTEND_BASE_URL =
   process.env.FRONTEND_BASE_URL || "http://localhost:5173";
@@ -103,7 +195,10 @@ console.log("FRONTEND_BASE_URL:", FRONTEND_BASE_URL);
 console.log("FINAL_VIEW_PATH:", FINAL_VIEW_PATH);
 console.log("ONEAUTHEN_ENABLED:", ONEAUTHEN_ENABLED);
 console.log("ONEAUTHEN_ENDPOINT:", ONEAUTHEN_ENDPOINT);
-console.log("ONEAUTHEN_CAD_DATA:", ONEAUTHEN_CAD_DATA ? redact(ONEAUTHEN_CAD_DATA) : "(empty)");
+console.log(
+  "ONEAUTHEN_CAD_DATA:",
+  ONEAUTHEN_CAD_DATA ? redact(ONEAUTHEN_CAD_DATA) : "(empty)",
+);
 console.log("mTLS using:", ONEAUTHEN_P12_PATH ? ".p12" : ".cert+.key");
 console.log("ONEAUTHEN_P12_PATH:", ONEAUTHEN_P12_PATH || "(empty)");
 console.log("========================================");
@@ -156,7 +251,7 @@ async function renderPdfFromUrl(url, reqId = "sys") {
 
     if (contentPdf.getPageCount() === 0) {
       const outBuf = Buffer.from(await coverPdf.save());
-      log(reqId, "🖨️ renderPdfFromUrl done (cover only), size:", outBuf.length, "bytes, ms:", Date.now() - t0);
+      log(reqId, "🖨️ renderPdfFromUrl done (cover only), bytes:", outBuf.length, "ms:", Date.now() - t0);
       return outBuf;
     }
 
@@ -164,14 +259,11 @@ async function renderPdfFromUrl(url, reqId = "sys") {
     const [coverPage] = await out.copyPages(coverPdf, [0]);
     out.addPage(coverPage);
 
-    const contentPages = await out.copyPages(
-      contentPdf,
-      contentPdf.getPageIndices()
-    );
+    const contentPages = await out.copyPages(contentPdf, contentPdf.getPageIndices());
     contentPages.forEach((p) => out.addPage(p));
 
     const outBuf = Buffer.from(await out.save());
-    log(reqId, "🖨️ renderPdfFromUrl done, pages:", 1 + contentPdf.getPageCount(), "size:", outBuf.length, "bytes, ms:", Date.now() - t0);
+    log(reqId, "🖨️ renderPdfFromUrl done, pages:", 1 + contentPdf.getPageCount(), "bytes:", outBuf.length, "ms:", Date.now() - t0);
     return outBuf;
   } finally {
     await browser.close();
@@ -192,7 +284,7 @@ function buildOneAuthenAgent(reqId = "sys") {
   } else {
     if (!ONEAUTHEN_CERT_PATH || !ONEAUTHEN_KEY_PATH) {
       throw new Error(
-        "Missing mTLS cert config: set ONEAUTHEN_P12_PATH or (ONEAUTHEN_CERT_PATH + ONEAUTHEN_KEY_PATH)"
+        "Missing mTLS cert config: set ONEAUTHEN_P12_PATH or (ONEAUTHEN_CERT_PATH + ONEAUTHEN_KEY_PATH)",
       );
     }
     if (!fs.existsSync(ONEAUTHEN_CERT_PATH)) {
@@ -241,11 +333,7 @@ function httpsJsonRequest(urlString, bodyObj, agent, timeoutMs = 120000, reqId =
       res.on("end", () => {
         const buf = Buffer.concat(chunks);
         log(reqId, "🌐 OneAuthen HTTP done:", res.statusCode, "ct:", res.headers["content-type"] || "-", "bytes:", buf.length, "ms:", Date.now() - t0);
-        resolve({
-          statusCode: res.statusCode,
-          headers: res.headers,
-          buffer: buf,
-        });
+        resolve({ statusCode: res.statusCode, headers: res.headers, buffer: buf });
       });
     });
 
@@ -282,13 +370,11 @@ async function signPdfWithOneAuthen(pdfBuffer, reqId = "sys") {
   };
 
   if (ONEAUTHEN_VISIBLE_SIGNATURE) payload.visibleSignature = ONEAUTHEN_VISIBLE_SIGNATURE;
-  if (typeof ONEAUTHEN_OVERWRITE_ORIGINAL === "boolean")
-    payload.overwriteOriginal = ONEAUTHEN_OVERWRITE_ORIGINAL;
+  if (typeof ONEAUTHEN_OVERWRITE_ORIGINAL === "boolean") payload.overwriteOriginal = ONEAUTHEN_OVERWRITE_ORIGINAL;
 
   const resp = await httpsJsonRequest(ONEAUTHEN_ENDPOINT, payload, agent, 120000, reqId);
   const ct = String(resp.headers["content-type"] || "").toLowerCase();
 
-  // ถ้า status ไม่ใช่ 2xx ให้ log ตัวอย่าง body สั้นๆ (ช่วย debug)
   if (!(resp.statusCode >= 200 && resp.statusCode < 300)) {
     const preview = resp.buffer.toString("utf8").slice(0, 400);
     warn(reqId, "⚠️ OneAuthen non-2xx:", resp.statusCode, "body preview:", preview);
@@ -306,7 +392,7 @@ async function signPdfWithOneAuthen(pdfBuffer, reqId = "sys") {
     throw new Error(
       `OneAuthen unexpected response (status=${resp.statusCode}, content-type=${ct}): ${resp.buffer
         .toString("utf8")
-        .slice(0, 500)}`
+        .slice(0, 500)}`,
     );
   }
 
@@ -319,16 +405,89 @@ async function signPdfWithOneAuthen(pdfBuffer, reqId = "sys") {
 
   if (!base64) {
     throw new Error(
-      `OneAuthen response has no pdfData (status=${resp.statusCode}): ${JSON.stringify(json).slice(
-        0,
-        500
-      )}`
+      `OneAuthen response has no pdfData (status=${resp.statusCode}): ${JSON.stringify(json).slice(0, 500)}`,
     );
   }
 
   const out = Buffer.from(String(base64), "base64");
   log(reqId, "✅ OneAuthen returned pdfData(base64). bytes:", out.length);
   return out;
+}
+
+// ---------- DB helpers ----------
+async function getContractByDocumentId(conn, documentId) {
+  const [rows] = await conn.query(
+    "SELECT id, document_id, config, status, company_email, customer_email, final_sent_at FROM contracts WHERE document_id = ?",
+    [documentId],
+  );
+  return rows[0] || null;
+}
+
+async function getSignaturesByContractId(conn, contractId) {
+  const [rows] = await conn.query(
+    `
+    SELECT role, signature_image, signer_name, signer_position, signer_role, signed_at
+    FROM signatures
+    WHERE contract_id = ?
+    ORDER BY signer_role ASC, role ASC, signed_at ASC
+    `,
+    [contractId],
+  );
+  return rows;
+}
+
+function groupSignaturesToMap(rows) {
+  // map: { CUSTOMER: { role: row }, COMPANY: { role: row } }
+  const out = { CUSTOMER: {}, COMPANY: {} };
+  for (const r of rows) {
+    const sr = String(r.signer_role || "").toUpperCase();
+    if (sr === "CUSTOMER" || sr === "COMPANY") {
+      out[sr][r.role] = r;
+    }
+  }
+  return out;
+}
+
+async function upsertSignature(conn, {
+  contractId,
+  role,
+  signerRole, // 'CUSTOMER' | 'COMPANY'
+  image,
+  name,
+  position,
+}) {
+  await conn.query(
+    `
+    INSERT INTO signatures
+      (contract_id, role, signature_image, signer_name, signer_position, signer_role, signed_at)
+    VALUES
+      (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON DUPLICATE KEY UPDATE
+      signature_image = VALUES(signature_image),
+      signer_name = VALUES(signer_name),
+      signer_position = VALUES(signer_position),
+      signed_at = CURRENT_TIMESTAMP
+    `,
+    [contractId, role, image, name, position, signerRole],
+  );
+}
+
+function assertRolesAllowed(payloadRoles, allowedRoles) {
+  const allowed = new Set(allowedRoles || []);
+  for (const r of payloadRoles) {
+    if (!allowed.has(r)) {
+      const a = Array.from(allowed).join(", ");
+      throw new Error(`ROLE_NOT_ALLOWED:${r}:${a}`);
+    }
+  }
+}
+
+function assertSignedAll(requiredRoles, signedMap, signerRole) {
+  const missing = [];
+  for (const r of requiredRoles) {
+    if (!signedMap?.[signerRole]?.[r]?.signature_image) missing.push(r);
+  }
+  return missing;
 }
 
 // ---------- Routes ----------
@@ -343,7 +502,6 @@ app.get("/api/health", async (req, res) => {
     res.status(500).json({ status: "error", error: e.message });
   }
 });
-
 
 app.get("/health/puppeteer", async (req, res) => {
   const reqId = rid();
@@ -362,14 +520,17 @@ app.get("/health/puppeteer", async (req, res) => {
   }
 });
 
-// เทสว่า mTLS ต่อ OneAuthen ได้ไหม (ยิง request แบบ dummy)
 app.get("/health/oneauthen", async (req, res) => {
   const reqId = rid();
   try {
     log(reqId, "➡️ /health/oneauthen called. enabled =", ONEAUTHEN_ENABLED);
 
     if (!ONEAUTHEN_ENABLED) {
-      return res.json({ ok: true, enabled: false, note: "ONEAUTHEN_ENABLED=false" });
+      return res.json({
+        ok: true,
+        enabled: false,
+        note: "ONEAUTHEN_ENABLED=false",
+      });
     }
 
     const agent = buildOneAuthenAgent(reqId);
@@ -394,7 +555,11 @@ app.get("/health/oneauthen", async (req, res) => {
     });
   } catch (e) {
     errlog(reqId, "❌ /health/oneauthen error:", e.message || e);
-    res.status(500).json({ ok: false, enabled: ONEAUTHEN_ENABLED, error: String(e.message || e) });
+    res.status(500).json({
+      ok: false,
+      enabled: ONEAUTHEN_ENABLED,
+      error: String(e.message || e),
+    });
   }
 });
 
@@ -412,9 +577,10 @@ app.post("/api/contracts", async (req, res) => {
     }
 
     const documentId = "DOC-" + Date.now();
+
     await db.query(
       "INSERT INTO contracts (document_id, config, status, company_email) VALUES (?, ?, ?, ?)",
-      [documentId, JSON.stringify(config), "PENDING", companyEmail]
+      [documentId, JSON.stringify(config), "PENDING", companyEmail],
     );
 
     log(reqId, "✅ Contract created:", documentId);
@@ -429,10 +595,8 @@ app.get("/api/contracts/:documentId", async (req, res) => {
   const reqId = rid();
   try {
     const { documentId } = req.params;
-    const [rows] = await db.query(
-      "SELECT * FROM contracts WHERE document_id = ?",
-      [documentId]
-    );
+    const [rows] = await db.query("SELECT * FROM contracts WHERE document_id = ?", [documentId]);
+
     if (!rows.length) return res.status(404).json({ message: "Contract not found" });
 
     log(reqId, "✅ Get contract:", documentId, "status:", rows[0].status);
@@ -457,23 +621,23 @@ app.get("/api/contracts/:documentId/signatures", async (req, res) => {
   const { documentId } = req.params;
 
   try {
-    const [signatures] = await db.query(
+    const [rows] = await db.query(
       `
-      SELECT role, signature_image, signer_role, signed_at
+      SELECT role, signature_image, signer_name, signer_position, signer_role, signed_at
       FROM signatures
       WHERE contract_id = (SELECT id FROM contracts WHERE document_id = ?)
-      ORDER BY signed_at ASC
+      ORDER BY signer_role ASC, role ASC, signed_at ASC
       `,
-      [documentId]
+      [documentId],
     );
 
-    if (!signatures.length) {
+    if (!rows.length) {
       warn(reqId, "No signatures for:", documentId);
       return res.status(404).json({ message: "No signatures found for this contract" });
     }
 
-    log(reqId, "✅ Signatures fetched:", documentId, "count:", signatures.length);
-    res.json({ signatures });
+    log(reqId, "✅ Signatures fetched:", documentId, "count:", rows.length);
+    res.json({ signatures: rows });
   } catch (e) {
     errlog(reqId, "❌ Fetch signatures failed:", e.message || e);
     res.status(500).json({ message: "Fetch signatures failed" });
@@ -491,10 +655,7 @@ app.post("/api/send-sign-email", async (req, res) => {
       return res.status(400).json({ message: "invalid email" });
     }
 
-    const [rows] = await db.query(
-      "SELECT id FROM contracts WHERE document_id = ?",
-      [documentId]
-    );
+    const [rows] = await db.query("SELECT id FROM contracts WHERE document_id = ?", [documentId]);
     if (!rows.length) return res.status(404).json({ message: "Contract not found" });
 
     const contractId = rows[0].id;
@@ -513,9 +674,12 @@ app.post("/api/send-sign-email", async (req, res) => {
       to: String(email).trim(),
       subject: "กรุณาเซ็นเอกสาร",
       html: `
-        <h3>กรุณาเซ็นเอกสาร</h3>
-        <p>คลิกลิงก์ด้านล่างเพื่อเซ็นเอกสาร</p>
-        <a href="${signLink}">${signLink}</a>
+        <h3>เรียน ผู้มีอำนาจลงนาม</h3>
+        <p>บริษัท บิลด์มีอัพ คอนซัลแทนท์ จำกัด ขอส่งเอกสารเพื่อให้ท่านตรวจสอบและลงนามผ่านระบบลงนามอิเล็กทรอนิกส์ (E-Sign)</p>
+        <p>กรุณาคลิกลิงก์ด้านล่างเพื่อเข้าดูรายละเอียดและลงนามในเอกสาร</p>
+        <p><a href="${signLink}">${signLink}</a></p>
+        <p>หากมีข้อสงสัยสามารถติดต่อกลับบริษัทได้ตามช่องทางที่ท่านสะดวก</p>
+        <p>ขอขอบพระคุณ<br/>บริษัท บิลด์มีอัพ คอนซัลแทนท์ จำกัด</p>
       `,
     });
 
@@ -532,6 +696,7 @@ app.post("/api/send-sign-email", async (req, res) => {
   }
 });
 
+// ---------- CUSTOMER SIGN ----------
 app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
   const reqId = rid();
   const { documentId } = req.params;
@@ -541,80 +706,114 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
     return res.status(400).json({ message: "signatures required" });
   }
 
-  const conn = await db.getConnection();
+  const items = normalizeSignaturesPayload(signatures);
+  if (!items.length) return res.status(400).json({ message: "signatures payload is empty" });
 
+  const conn = await db.getConnection();
   try {
-    log(
-      reqId,
-      "✍️ Customer sign start:",
-      documentId,
-      "roles:",
-      Object.keys(signatures).join(",")
-    );
+    log(reqId, "✍️ Customer sign start:", documentId, "roles:", items.map((x) => x.role).join(","));
 
     await conn.beginTransaction();
 
-    const [contracts] = await conn.query(
-      "SELECT id, status, company_email FROM contracts WHERE document_id = ?",
-      [documentId]
-    );
-
-    if (!contracts.length) {
+    const contract = await getContractByDocumentId(conn, documentId);
+    if (!contract) {
       await conn.rollback();
       return res.status(404).json({ message: "Contract not found" });
     }
 
-    const contract = contracts[0];
-    const contractId = contract.id;
-    const companyEmail = contract.company_email;
-
-    if (contract.status === "CUSTOMER_SIGNED" || contract.status === "COMPLETED") {
+    if (contract.status === "COMPLETED") {
       await conn.rollback();
-      warn(reqId, "❌ Customer already signed. status =", contract.status);
+      return res.status(409).json({ message: "Contract already completed" });
+    }
+    if (contract.status === "CUSTOMER_SIGNED") {
+      await conn.rollback();
       return res.status(409).json({ message: "Customer already signed" });
     }
 
-    for (const role of Object.keys(signatures)) {
-      const image = signatures[role];
-      if (!isDataUrl(image)) {
-        await conn.rollback();
-        return res
-          .status(400)
-          .json({ message: `Invalid signature image for role: ${role}` });
-      }
+    const config = JSON.parse(contract.config || "{}");
+    const requiredAll = extractRequiredRolesFromConfig(config);
+    const split = splitRolesBySigner(requiredAll);
+    const requiredCustomer = split.customer;
 
-      await conn.query(
-        `
-        INSERT INTO signatures (contract_id, role, signature_image, signer_role)
-        VALUES (?, ?, ?, 'CUSTOMER')
-        ON DUPLICATE KEY UPDATE
-          signature_image = VALUES(signature_image),
-          signed_at = CURRENT_TIMESTAMP
-        `,
-        [contractId, role, image]
-      );
+    if (!requiredCustomer.length) {
+      await conn.rollback();
+      return res.status(500).json({
+        message: "Cannot determine required CUSTOMER roles from config.signatures. Please use role naming like 'customer_*'.",
+      });
     }
 
-    await conn.query("UPDATE contracts SET status = 'CUSTOMER_SIGNED' WHERE id = ?", [
-      contractId,
-    ]);
+    // validate payload roles
+    for (const it of items) {
+      if (!validateRoleBasic(it.role)) {
+        await conn.rollback();
+        return res.status(400).json({ message: `Invalid role: ${it.role}` });
+      }
+      if (!isDataUrl(it.image)) {
+        await conn.rollback();
+        return res.status(400).json({ message: `Invalid signature image for role: ${it.role}` });
+      }
+    }
+    try {
+      assertRolesAllowed(items.map((x) => x.role), requiredCustomer);
+    } catch (e) {
+      await conn.rollback();
+      const msg = String(e.message || "");
+      if (msg.startsWith("ROLE_NOT_ALLOWED:")) {
+        const parts = msg.split(":");
+        return res.status(400).json({
+          message: `Role not allowed for CUSTOMER: ${parts[1]}`,
+          allowed: (parts[2] || "").split(",").map((s) => s.trim()).filter(Boolean),
+        });
+      }
+      return res.status(400).json({ message: msg });
+    }
 
+    // upsert signatures
+    for (const it of items) {
+      await upsertSignature(conn, {
+        contractId: contract.id,
+        role: it.role,
+        signerRole: "CUSTOMER",
+        image: it.image,
+        name: it.name,
+        position: it.position,
+      });
+    }
+
+    // check signed all required CUSTOMER
+    const sigRows = await getSignaturesByContractId(conn, contract.id);
+    const map = groupSignaturesToMap(sigRows);
+    const missing = assertSignedAll(requiredCustomer, map, "CUSTOMER");
+
+    if (missing.length) {
+      // ยังไม่ครบ -> ยังไม่อัปเดต status
+      await conn.commit();
+      log(reqId, "✅ Customer partial signed. missing:", missing.join(","));
+      return res.json({
+        message: "Customer signed partially",
+        signedCount: Object.keys(map.CUSTOMER || {}).length,
+        requiredCount: requiredCustomer.length,
+        missing,
+      });
+    }
+
+    // ครบ -> update status
+    await conn.query("UPDATE contracts SET status = 'CUSTOMER_SIGNED' WHERE id = ?", [contract.id]);
     await conn.commit();
-    log(reqId, "✅ Customer sign committed:", documentId);
+    log(reqId, "✅ Customer signed ALL. status => CUSTOMER_SIGNED", documentId);
 
-    if (companyEmail) {
+    // notify company
+    if (contract.company_email) {
       const adminLink = `${FRONTEND_BASE_URL}/admin/sign/${documentId}`;
-      log(reqId, "📧 Notify company:", String(companyEmail).trim(), "adminLink:", adminLink);
-
       await transporter.sendMail({
         from: `"E-Sign System" <${process.env.MAIL_USER}>`,
-        to: String(companyEmail).trim(),
+        to: String(contract.company_email).trim(),
         subject: "ลูกค้าเซ็นเอกสารเรียบร้อยแล้ว",
         html: `
-          <h3>ลูกค้าได้เซ็นเอกสารเรียบร้อย</h3>
-          <p>เลขที่เอกสาร: <b>${documentId}</b></p>
-          <p>คลิกเพื่อตรวจสอบเอกสาร</p>
-          <a href="${adminLink}">${adminLink}</a>
+          <h3>แจ้งเตือน: ลูกค้าเซ็นเอกสารเรียบร้อยแล้ว</h3>
+          <p>เอกสารหมายเลข <b>${documentId}</b> ลูกค้าได้ดำเนินการลงนามครบเรียบร้อยแล้ว</p>
+          <p><a href="${adminLink}">${adminLink}</a></p>
+          <p>ระบบลงนามอิเล็กทรอนิกส์ (E-Sign System)<br/>บริษัท บิลด์มีอัพ คอนซัลแทนท์ จำกัด</p>
         `,
       });
     }
@@ -623,13 +822,13 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
   } catch (e) {
     await conn.rollback();
     errlog(reqId, "❌ Customer sign failed:", e.message || e);
-    return res.status(500).json({ message: "Customer sign failed" });
+    return res.status(500).json({ message: "Customer sign failed", error: String(e.message || e) });
   } finally {
     conn.release();
   }
 });
 
-
+// ---------- COMPANY SIGN ----------
 app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
   const reqId = rid();
   const { documentId } = req.params;
@@ -639,58 +838,99 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
     return res.status(400).json({ message: "signatures required" });
   }
 
-  const conn = await db.getConnection();
+  const items = normalizeSignaturesPayload(signatures);
+  if (!items.length) return res.status(400).json({ message: "signatures payload is empty" });
 
+  const conn = await db.getConnection();
   try {
-    log(reqId, "🏢 Company sign start:", documentId, "roles:", Object.keys(signatures).join(","));
+    log(reqId, "🏢 Company sign start:", documentId, "roles:", items.map((x) => x.role).join(","));
+
     await conn.beginTransaction();
 
-    const [contracts] = await conn.query(
-      "SELECT id, status, company_email, customer_email, final_sent_at FROM contracts WHERE document_id = ?",
-      [documentId]
-    );
-
-    if (!contracts.length) {
+    const contract = await getContractByDocumentId(conn, documentId);
+    if (!contract) {
       await conn.rollback();
       return res.status(404).json({ message: "Contract not found" });
     }
 
-    const contract = contracts[0];
-
     if (contract.status !== "CUSTOMER_SIGNED") {
       await conn.rollback();
-      warn(reqId, "❌ Not ready for company sign. status =", contract.status);
       return res.status(400).json({ message: "Contract is not ready for company sign" });
     }
 
-    const contractId = contract.id;
+    const config = JSON.parse(contract.config || "{}");
+    const requiredAll = extractRequiredRolesFromConfig(config);
+    const split = splitRolesBySigner(requiredAll);
+    const requiredCompany = split.company;
 
-    for (const role of Object.keys(signatures)) {
-      const image = signatures[role];
-      if (!isDataUrl(image)) {
-        await conn.rollback();
-        return res.status(400).json({ message: "Invalid signature image" });
-      }
-
-      await conn.query(
-        `
-        INSERT INTO signatures (contract_id, role, signature_image, signer_role)
-        VALUES (?, ?, ?, 'COMPANY')
-        ON DUPLICATE KEY UPDATE
-          signature_image = VALUES(signature_image),
-          signed_at = CURRENT_TIMESTAMP
-        `,
-        [contractId, role, image]
-      );
+    if (!requiredCompany.length) {
+      await conn.rollback();
+      return res.status(500).json({
+        message: "Cannot determine required COMPANY roles from config.signatures. Please use role naming like 'company_*'.",
+      });
     }
 
-    await conn.query("UPDATE contracts SET status = 'COMPLETED' WHERE id = ?", [
-      contractId,
-    ]);
+    // validate payload roles
+    for (const it of items) {
+      if (!validateRoleBasic(it.role)) {
+        await conn.rollback();
+        return res.status(400).json({ message: `Invalid role: ${it.role}` });
+      }
+      if (!isDataUrl(it.image)) {
+        await conn.rollback();
+        return res.status(400).json({ message: `Invalid signature image for role: ${it.role}` });
+      }
+    }
 
+    try {
+      assertRolesAllowed(items.map((x) => x.role), requiredCompany);
+    } catch (e) {
+      await conn.rollback();
+      const msg = String(e.message || "");
+      if (msg.startsWith("ROLE_NOT_ALLOWED:")) {
+        const parts = msg.split(":");
+        return res.status(400).json({
+          message: `Role not allowed for COMPANY: ${parts[1]}`,
+          allowed: (parts[2] || "").split(",").map((s) => s.trim()).filter(Boolean),
+        });
+      }
+      return res.status(400).json({ message: msg });
+    }
+
+    // upsert company signatures
+    for (const it of items) {
+      await upsertSignature(conn, {
+        contractId: contract.id,
+        role: it.role,
+        signerRole: "COMPANY",
+        image: it.image,
+        name: it.name,
+        position: it.position,
+      });
+    }
+
+    // check signed all required COMPANY
+    const sigRows = await getSignaturesByContractId(conn, contract.id);
+    const map = groupSignaturesToMap(sigRows);
+    const missing = assertSignedAll(requiredCompany, map, "COMPANY");
+
+    if (missing.length) {
+      await conn.commit();
+      log(reqId, "✅ Company partial signed. missing:", missing.join(","));
+      return res.json({
+        message: "Company signed partially",
+        signedCount: Object.keys(map.COMPANY || {}).length,
+        requiredCount: requiredCompany.length,
+        missing,
+      });
+    }
+
+    // all signed -> COMPLETED
+    await conn.query("UPDATE contracts SET status = 'COMPLETED' WHERE id = ?", [contract.id]);
     await conn.commit();
-    log(reqId, "✅ Company sign committed:", documentId);
+    log(reqId, "✅ Company signed ALL. status => COMPLETED", documentId);
 
+    // recipients
     const toList = uniqEmails([contract.company_email, contract.customer_email]);
     if (!toList.length) {
       warn(reqId, "No recipients, finish without email.");
@@ -755,7 +995,7 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
 
     const [upd] = await db.query(
       "UPDATE contracts SET final_sent_at = CURRENT_TIMESTAMP WHERE id = ? AND final_sent_at IS NULL",
-      [contractId]
+      [contract.id],
     );
 
     if (upd.affectedRows === 0) {
@@ -766,13 +1006,13 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
     }
 
     log(reqId, "✅ Final PDF emailed + final_sent_at updated. Done.");
-    res.json({
+    return res.json({
       message: `Company signed successfully (PDF emailed${ONEAUTHEN_ENABLED ? ", OneAuthen signed" : ""})`,
     });
   } catch (e) {
     await conn.rollback();
     errlog(reqId, "❌ Company sign failed:", e.message || e);
-    res.status(500).json({ message: "Company sign failed" });
+    return res.status(500).json({ message: "Company sign failed", error: String(e.message || e) });
   } finally {
     conn.release();
   }
