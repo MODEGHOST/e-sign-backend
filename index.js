@@ -92,9 +92,17 @@ function normalizeSignaturesPayload(signatures) {
     }
 
     if (v && typeof v === "object") {
-      const image = v.image || v.signature_image || v.dataUrl || null;
-      const name = safeStr(v.name, 100);
-      const position = safeStr(v.position, 255);
+      const image =
+        v.image || v.signature_image || v.dataUrl || v.signature || null;
+      const name = safeStr(
+        v.signer_name ?? v.name ?? v.signerName ?? null,
+        100,
+      );
+      const position = safeStr(
+        v.signer_position ?? v.position ?? v.signerPosition ?? null,
+        255,
+      );
+
       out.push({ role, image, name, position });
       continue;
     }
@@ -251,7 +259,13 @@ async function renderPdfFromUrl(url, reqId = "sys") {
 
     if (contentPdf.getPageCount() === 0) {
       const outBuf = Buffer.from(await coverPdf.save());
-      log(reqId, "🖨️ renderPdfFromUrl done (cover only), bytes:", outBuf.length, "ms:", Date.now() - t0);
+      log(
+        reqId,
+        "🖨️ renderPdfFromUrl done (cover only), bytes:",
+        outBuf.length,
+        "ms:",
+        Date.now() - t0,
+      );
       return outBuf;
     }
 
@@ -259,11 +273,22 @@ async function renderPdfFromUrl(url, reqId = "sys") {
     const [coverPage] = await out.copyPages(coverPdf, [0]);
     out.addPage(coverPage);
 
-    const contentPages = await out.copyPages(contentPdf, contentPdf.getPageIndices());
+    const contentPages = await out.copyPages(
+      contentPdf,
+      contentPdf.getPageIndices(),
+    );
     contentPages.forEach((p) => out.addPage(p));
 
     const outBuf = Buffer.from(await out.save());
-    log(reqId, "🖨️ renderPdfFromUrl done, pages:", 1 + contentPdf.getPageCount(), "bytes:", outBuf.length, "ms:", Date.now() - t0);
+    log(
+      reqId,
+      "🖨️ renderPdfFromUrl done, pages:",
+      1 + contentPdf.getPageCount(),
+      "bytes:",
+      outBuf.length,
+      "ms:",
+      Date.now() - t0,
+    );
     return outBuf;
   } finally {
     await browser.close();
@@ -293,7 +318,12 @@ function buildOneAuthenAgent(reqId = "sys") {
     if (!fs.existsSync(ONEAUTHEN_KEY_PATH)) {
       throw new Error(`ONEAUTHEN_KEY_PATH not found: ${ONEAUTHEN_KEY_PATH}`);
     }
-    log(reqId, "🔐 mTLS using CERT+KEY:", ONEAUTHEN_CERT_PATH, ONEAUTHEN_KEY_PATH);
+    log(
+      reqId,
+      "🔐 mTLS using CERT+KEY:",
+      ONEAUTHEN_CERT_PATH,
+      ONEAUTHEN_KEY_PATH,
+    );
     agentOptions.cert = fs.readFileSync(ONEAUTHEN_CERT_PATH);
     agentOptions.key = fs.readFileSync(ONEAUTHEN_KEY_PATH);
   }
@@ -309,7 +339,13 @@ function buildOneAuthenAgent(reqId = "sys") {
   return new https.Agent(agentOptions);
 }
 
-function httpsJsonRequest(urlString, bodyObj, agent, timeoutMs = 120000, reqId = "sys") {
+function httpsJsonRequest(
+  urlString,
+  bodyObj,
+  agent,
+  timeoutMs = 120000,
+  reqId = "sys",
+) {
   const u = new URL(urlString);
   const body = Buffer.from(JSON.stringify(bodyObj), "utf8");
 
@@ -332,8 +368,22 @@ function httpsJsonRequest(urlString, bodyObj, agent, timeoutMs = 120000, reqId =
       res.on("data", (d) => chunks.push(d));
       res.on("end", () => {
         const buf = Buffer.concat(chunks);
-        log(reqId, "🌐 OneAuthen HTTP done:", res.statusCode, "ct:", res.headers["content-type"] || "-", "bytes:", buf.length, "ms:", Date.now() - t0);
-        resolve({ statusCode: res.statusCode, headers: res.headers, buffer: buf });
+        log(
+          reqId,
+          "🌐 OneAuthen HTTP done:",
+          res.statusCode,
+          "ct:",
+          res.headers["content-type"] || "-",
+          "bytes:",
+          buf.length,
+          "ms:",
+          Date.now() - t0,
+        );
+        resolve({
+          statusCode: res.statusCode,
+          headers: res.headers,
+          buffer: buf,
+        });
       });
     });
 
@@ -359,7 +409,15 @@ async function signPdfWithOneAuthen(pdfBuffer, reqId = "sys") {
 
   log(reqId, "🔏 signPdfWithOneAuthen start. pdf bytes:", pdfBuffer.length);
   log(reqId, "🔏 endpoint:", ONEAUTHEN_ENDPOINT);
-  log(reqId, "🔏 certifyLevel:", ONEAUTHEN_CERTIFY_LEVEL, "visibleSignature:", ONEAUTHEN_VISIBLE_SIGNATURE, "overwriteOriginal:", ONEAUTHEN_OVERWRITE_ORIGINAL);
+  log(
+    reqId,
+    "🔏 certifyLevel:",
+    ONEAUTHEN_CERTIFY_LEVEL,
+    "visibleSignature:",
+    ONEAUTHEN_VISIBLE_SIGNATURE,
+    "overwriteOriginal:",
+    ONEAUTHEN_OVERWRITE_ORIGINAL,
+  );
 
   const agent = buildOneAuthenAgent(reqId);
 
@@ -369,15 +427,29 @@ async function signPdfWithOneAuthen(pdfBuffer, reqId = "sys") {
     certifyLevel: ONEAUTHEN_CERTIFY_LEVEL,
   };
 
-  if (ONEAUTHEN_VISIBLE_SIGNATURE) payload.visibleSignature = ONEAUTHEN_VISIBLE_SIGNATURE;
-  if (typeof ONEAUTHEN_OVERWRITE_ORIGINAL === "boolean") payload.overwriteOriginal = ONEAUTHEN_OVERWRITE_ORIGINAL;
+  if (ONEAUTHEN_VISIBLE_SIGNATURE)
+    payload.visibleSignature = ONEAUTHEN_VISIBLE_SIGNATURE;
+  if (typeof ONEAUTHEN_OVERWRITE_ORIGINAL === "boolean")
+    payload.overwriteOriginal = ONEAUTHEN_OVERWRITE_ORIGINAL;
 
-  const resp = await httpsJsonRequest(ONEAUTHEN_ENDPOINT, payload, agent, 120000, reqId);
+  const resp = await httpsJsonRequest(
+    ONEAUTHEN_ENDPOINT,
+    payload,
+    agent,
+    120000,
+    reqId,
+  );
   const ct = String(resp.headers["content-type"] || "").toLowerCase();
 
   if (!(resp.statusCode >= 200 && resp.statusCode < 300)) {
     const preview = resp.buffer.toString("utf8").slice(0, 400);
-    warn(reqId, "⚠️ OneAuthen non-2xx:", resp.statusCode, "body preview:", preview);
+    warn(
+      reqId,
+      "⚠️ OneAuthen non-2xx:",
+      resp.statusCode,
+      "body preview:",
+      preview,
+    );
   }
 
   if (ct.includes("application/pdf")) {
@@ -448,14 +520,17 @@ function groupSignaturesToMap(rows) {
   return out;
 }
 
-async function upsertSignature(conn, {
-  contractId,
-  role,
-  signerRole, // 'CUSTOMER' | 'COMPANY'
-  image,
-  name,
-  position,
-}) {
+async function upsertSignature(
+  conn,
+  {
+    contractId,
+    role,
+    signerRole, // 'CUSTOMER' | 'COMPANY'
+    image,
+    name,
+    position,
+  },
+) {
   await conn.query(
     `
     INSERT INTO signatures
@@ -543,9 +618,20 @@ app.get("/health/oneauthen", async (req, res) => {
       overwriteOriginal: ONEAUTHEN_OVERWRITE_ORIGINAL,
     };
 
-    const resp = await httpsJsonRequest(ONEAUTHEN_ENDPOINT, payload, agent, 30000, reqId);
+    const resp = await httpsJsonRequest(
+      ONEAUTHEN_ENDPOINT,
+      payload,
+      agent,
+      30000,
+      reqId,
+    );
 
-    log(reqId, "✅ /health/oneauthen done:", resp.statusCode, resp.headers["content-type"] || "-");
+    log(
+      reqId,
+      "✅ /health/oneauthen done:",
+      resp.statusCode,
+      resp.headers["content-type"] || "-",
+    );
 
     res.json({
       ok: true,
@@ -595,9 +681,13 @@ app.get("/api/contracts/:documentId", async (req, res) => {
   const reqId = rid();
   try {
     const { documentId } = req.params;
-    const [rows] = await db.query("SELECT * FROM contracts WHERE document_id = ?", [documentId]);
+    const [rows] = await db.query(
+      "SELECT * FROM contracts WHERE document_id = ?",
+      [documentId],
+    );
 
-    if (!rows.length) return res.status(404).json({ message: "Contract not found" });
+    if (!rows.length)
+      return res.status(404).json({ message: "Contract not found" });
 
     log(reqId, "✅ Get contract:", documentId, "status:", rows[0].status);
     res.json({
@@ -633,7 +723,9 @@ app.get("/api/contracts/:documentId/signatures", async (req, res) => {
 
     if (!rows.length) {
       warn(reqId, "No signatures for:", documentId);
-      return res.status(404).json({ message: "No signatures found for this contract" });
+      return res
+        .status(404)
+        .json({ message: "No signatures found for this contract" });
     }
 
     log(reqId, "✅ Signatures fetched:", documentId, "count:", rows.length);
@@ -655,8 +747,12 @@ app.post("/api/send-sign-email", async (req, res) => {
       return res.status(400).json({ message: "invalid email" });
     }
 
-    const [rows] = await db.query("SELECT id FROM contracts WHERE document_id = ?", [documentId]);
-    if (!rows.length) return res.status(404).json({ message: "Contract not found" });
+    const [rows] = await db.query(
+      "SELECT id FROM contracts WHERE document_id = ?",
+      [documentId],
+    );
+    if (!rows.length)
+      return res.status(404).json({ message: "Contract not found" });
 
     const contractId = rows[0].id;
 
@@ -683,10 +779,10 @@ app.post("/api/send-sign-email", async (req, res) => {
       `,
     });
 
-    await db.query("INSERT INTO email_logs (contract_id, email) VALUES (?, ?)", [
-      contractId,
-      String(email).trim(),
-    ]);
+    await db.query(
+      "INSERT INTO email_logs (contract_id, email) VALUES (?, ?)",
+      [contractId, String(email).trim()],
+    );
 
     log(reqId, "✅ Email sent:", email, "doc:", documentId);
     res.json({ message: "Email sent successfully" });
@@ -707,11 +803,18 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
   }
 
   const items = normalizeSignaturesPayload(signatures);
-  if (!items.length) return res.status(400).json({ message: "signatures payload is empty" });
+  if (!items.length)
+    return res.status(400).json({ message: "signatures payload is empty" });
 
   const conn = await db.getConnection();
   try {
-    log(reqId, "✍️ Customer sign start:", documentId, "roles:", items.map((x) => x.role).join(","));
+    log(
+      reqId,
+      "✍️ Customer sign start:",
+      documentId,
+      "roles:",
+      items.map((x) => x.role).join(","),
+    );
 
     await conn.beginTransaction();
 
@@ -738,7 +841,8 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
     if (!requiredCustomer.length) {
       await conn.rollback();
       return res.status(500).json({
-        message: "Cannot determine required CUSTOMER roles from config.signatures. Please use role naming like 'customer_*'.",
+        message:
+          "Cannot determine required CUSTOMER roles from config.signatures. Please use role naming like 'customer_*'.",
       });
     }
 
@@ -750,11 +854,16 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
       }
       if (!isDataUrl(it.image)) {
         await conn.rollback();
-        return res.status(400).json({ message: `Invalid signature image for role: ${it.role}` });
+        return res
+          .status(400)
+          .json({ message: `Invalid signature image for role: ${it.role}` });
       }
     }
     try {
-      assertRolesAllowed(items.map((x) => x.role), requiredCustomer);
+      assertRolesAllowed(
+        items.map((x) => x.role),
+        requiredCustomer,
+      );
     } catch (e) {
       await conn.rollback();
       const msg = String(e.message || "");
@@ -762,7 +871,10 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
         const parts = msg.split(":");
         return res.status(400).json({
           message: `Role not allowed for CUSTOMER: ${parts[1]}`,
-          allowed: (parts[2] || "").split(",").map((s) => s.trim()).filter(Boolean),
+          allowed: (parts[2] || "")
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean),
         });
       }
       return res.status(400).json({ message: msg });
@@ -798,7 +910,10 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
     }
 
     // ครบ -> update status
-    await conn.query("UPDATE contracts SET status = 'CUSTOMER_SIGNED' WHERE id = ?", [contract.id]);
+    await conn.query(
+      "UPDATE contracts SET status = 'CUSTOMER_SIGNED' WHERE id = ?",
+      [contract.id],
+    );
     await conn.commit();
     log(reqId, "✅ Customer signed ALL. status => CUSTOMER_SIGNED", documentId);
 
@@ -822,7 +937,9 @@ app.post("/api/contracts/:documentId/customer-sign", async (req, res) => {
   } catch (e) {
     await conn.rollback();
     errlog(reqId, "❌ Customer sign failed:", e.message || e);
-    return res.status(500).json({ message: "Customer sign failed", error: String(e.message || e) });
+    return res
+      .status(500)
+      .json({ message: "Customer sign failed", error: String(e.message || e) });
   } finally {
     conn.release();
   }
@@ -839,11 +956,18 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
   }
 
   const items = normalizeSignaturesPayload(signatures);
-  if (!items.length) return res.status(400).json({ message: "signatures payload is empty" });
+  if (!items.length)
+    return res.status(400).json({ message: "signatures payload is empty" });
 
   const conn = await db.getConnection();
   try {
-    log(reqId, "🏢 Company sign start:", documentId, "roles:", items.map((x) => x.role).join(","));
+    log(
+      reqId,
+      "🏢 Company sign start:",
+      documentId,
+      "roles:",
+      items.map((x) => x.role).join(","),
+    );
 
     await conn.beginTransaction();
 
@@ -855,7 +979,9 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
 
     if (contract.status !== "CUSTOMER_SIGNED") {
       await conn.rollback();
-      return res.status(400).json({ message: "Contract is not ready for company sign" });
+      return res
+        .status(400)
+        .json({ message: "Contract is not ready for company sign" });
     }
 
     const config = JSON.parse(contract.config || "{}");
@@ -866,7 +992,8 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
     if (!requiredCompany.length) {
       await conn.rollback();
       return res.status(500).json({
-        message: "Cannot determine required COMPANY roles from config.signatures. Please use role naming like 'company_*'.",
+        message:
+          "Cannot determine required COMPANY roles from config.signatures. Please use role naming like 'company_*'.",
       });
     }
 
@@ -878,12 +1005,17 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
       }
       if (!isDataUrl(it.image)) {
         await conn.rollback();
-        return res.status(400).json({ message: `Invalid signature image for role: ${it.role}` });
+        return res
+          .status(400)
+          .json({ message: `Invalid signature image for role: ${it.role}` });
       }
     }
 
     try {
-      assertRolesAllowed(items.map((x) => x.role), requiredCompany);
+      assertRolesAllowed(
+        items.map((x) => x.role),
+        requiredCompany,
+      );
     } catch (e) {
       await conn.rollback();
       const msg = String(e.message || "");
@@ -891,7 +1023,10 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
         const parts = msg.split(":");
         return res.status(400).json({
           message: `Role not allowed for COMPANY: ${parts[1]}`,
-          allowed: (parts[2] || "").split(",").map((s) => s.trim()).filter(Boolean),
+          allowed: (parts[2] || "")
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean),
         });
       }
       return res.status(400).json({ message: msg });
@@ -926,20 +1061,33 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
     }
 
     // all signed -> COMPLETED
-    await conn.query("UPDATE contracts SET status = 'COMPLETED' WHERE id = ?", [contract.id]);
+    await conn.query("UPDATE contracts SET status = 'COMPLETED' WHERE id = ?", [
+      contract.id,
+    ]);
     await conn.commit();
     log(reqId, "✅ Company signed ALL. status => COMPLETED", documentId);
 
     // recipients
-    const toList = uniqEmails([contract.company_email, contract.customer_email]);
+    const toList = uniqEmails([
+      contract.company_email,
+      contract.customer_email,
+    ]);
     if (!toList.length) {
       warn(reqId, "No recipients, finish without email.");
-      return res.json({ message: "Company signed successfully (no recipients)" });
+      return res.json({
+        message: "Company signed successfully (no recipients)",
+      });
     }
 
     if (contract.final_sent_at) {
-      warn(reqId, "PDF already sent before. final_sent_at =", contract.final_sent_at);
-      return res.json({ message: "Company signed successfully (PDF already sent)" });
+      warn(
+        reqId,
+        "PDF already sent before. final_sent_at =",
+        contract.final_sent_at,
+      );
+      return res.json({
+        message: "Company signed successfully (PDF already sent)",
+      });
     }
 
     // 1) Render PDF
@@ -951,7 +1099,10 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
       pdfBuffer = await renderPdfFromUrl(pdfUrl, reqId);
     } catch (e) {
       errlog(reqId, "renderPdfFromUrl failed:", e.message || e);
-      return res.status(500).json({ message: "Failed to render PDF", error: String(e.message || e) });
+      return res.status(500).json({
+        message: "Failed to render PDF",
+        error: String(e.message || e),
+      });
     }
 
     // 2) OneAuthen sign
@@ -966,7 +1117,11 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
           error: String(e.message || e),
         });
       }
-      log(reqId, "🎉 OneAuthen sign success. signed pdf bytes:", pdfBuffer.length);
+      log(
+        reqId,
+        "🎉 OneAuthen sign success. signed pdf bytes:",
+        pdfBuffer.length,
+      );
     } else {
       warn(reqId, "🔕 OneAuthen disabled, skipping sign.");
     }
@@ -1001,7 +1156,8 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
     if (upd.affectedRows === 0) {
       warn(reqId, "final_sent_at already set by another process.");
       return res.json({
-        message: "Company signed successfully (PDF emailed, final_sent_at was already set)",
+        message:
+          "Company signed successfully (PDF emailed, final_sent_at was already set)",
       });
     }
 
@@ -1012,7 +1168,9 @@ app.post("/api/contracts/:documentId/company-sign", async (req, res) => {
   } catch (e) {
     await conn.rollback();
     errlog(reqId, "❌ Company sign failed:", e.message || e);
-    return res.status(500).json({ message: "Company sign failed", error: String(e.message || e) });
+    return res
+      .status(500)
+      .json({ message: "Company sign failed", error: String(e.message || e) });
   } finally {
     conn.release();
   }
