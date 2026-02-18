@@ -489,7 +489,7 @@ async function signPdfWithOneAuthen(pdfBuffer, reqId = "sys") {
 // ---------- DB helpers ----------
 async function getContractByDocumentId(conn, documentId) {
   const [rows] = await conn.query(
-    "SELECT id, document_id, config, status, company_email, customer_email, final_sent_at FROM contracts WHERE document_id = ?",
+    "SELECT id, document_id, config, status, company_email, customer_email, customer_company, customer_tax_id, customer_address, final_sent_at FROM contracts WHERE document_id = ?",
     [documentId],
   );
   return rows[0] || null;
@@ -664,9 +664,23 @@ app.post("/api/contracts", async (req, res) => {
 
     const documentId = "DOC-" + Date.now();
 
+    const partyB = config.partyB || {};
+    const customerCompany = safeStr(partyB.company, 255);
+    const customerTaxId = safeStr(partyB.taxId, 50);
+    // address might be long, let's allow up to 65535 for TEXT
+    const customerAddress = safeStr(partyB.address, 65535);
+
     await db.query(
-      "INSERT INTO contracts (document_id, config, status, company_email) VALUES (?, ?, ?, ?)",
-      [documentId, JSON.stringify(config), "PENDING", companyEmail],
+      "INSERT INTO contracts (document_id, config, status, company_email, customer_company, customer_tax_id, customer_address) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [
+        documentId,
+        JSON.stringify(config),
+        "PENDING",
+        companyEmail,
+        customerCompany,
+        customerTaxId,
+        customerAddress,
+      ],
     );
 
     log(reqId, "✅ Contract created:", documentId);
